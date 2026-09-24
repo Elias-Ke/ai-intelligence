@@ -6,6 +6,8 @@ test('relevance keeps unrelated records out of analyzed signals', () => {
   const result = scoreDiscovery({ title: 'Autumn music event', snippet: 'A regional concert', trustLevel: 1 });
   assert.ok(result.relevance < 35);
   assert.equal(result.evidenceLevel, 'single_source');
+  assert.ok(scoreDiscovery({ title: 'Autumn music event', snippet: 'A regional concert', trustLevel: 5 }).relevance < 35);
+  assert.ok(scoreDiscovery({ title: 'Introducing Claude for Teams', snippet: 'New release', trustLevel: 5 }).relevance >= 35);
 });
 
 test('official dated deployment earns explainable six-dimensional score', () => {

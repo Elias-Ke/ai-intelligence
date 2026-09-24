@@ -20,7 +20,7 @@ const topicSchema = z.object({
 });
 
 type Signal = { signalId: number; title: string; summary: string; signalType: string; valueScore: number; monetizationScore: number; adoptionScore: number; contentValueScore: number; evidenceLevel: string; hasConflict: number };
-type Evidence = { discoveryId: number; title: string; url: string; snippet: string };
+type Evidence = { discoveryId: number; title: string; url: string; snippet: string; publishedAt: string | null };
 
 export async function generateCards(app: FastifyInstance, taskId: number, deadline = Infinity) {
   const counts = { opportunities: 0, topics: 0, failed: 0, errorCode: null as number | null };
@@ -28,15 +28,15 @@ export async function generateCards(app: FastifyInstance, taskId: number, deadli
   const signals = app.db.prepare('SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.value_score valueScore,s.monetization_score monetizationScore,s.adoption_score adoptionScore,s.content_value_score contentValueScore,s.evidence_level evidenceLevel,s.has_conflict hasConflict FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id WHERE ss.task_id=? ORDER BY s.value_score DESC,s.signal_id DESC').all(taskId) as Signal[];
   for (const signal of signals) {
     if (Date.now() >= deadline) { counts.failed++; counts.errorCode ??= ErrorCodes.SCAN_TIMEOUT; break; }
-    const evidence = app.db.prepare('SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=?').all(signal.signalId) as Evidence[];
+    const evidence = app.db.prepare('SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,d.published_at publishedAt FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=?').all(signal.signalId) as Evidence[];
     if (!evidence.length) continue;
     const allowed = new Set(evidence.map(({ discoveryId }) => discoveryId));
-    const facts = JSON.stringify({ signalId: signal.signalId, title: signal.title, summary: signal.summary, evidence: evidence.map(({ discoveryId, title, url, snippet }) => ({ discoveryId, title, url, snippet: snippet.slice(0, 300) })) });
-    const fallback = `原文标题：${signal.title}。已记录 ${evidence.length} 条来源，具体变化请核查原文。`;
+    const facts = JSON.stringify({ signalId: signal.signalId, title: signal.title, summary: signal.summary, evidence: evidence.map(({ discoveryId, title, url, snippet, publishedAt }) => ({ discoveryId, title, url, snippet: snippet.slice(0, 300), publishedAt })) });
+    const fallback = `原文标题：${signal.title}。已记录 ${evidence.length} 条来源，${evidence.every(({ publishedAt }) => !publishedAt) ? '发布时间待核查，' : ''}具体变化请核查原文。`;
     let summary = fallback;
     if (configured) {
       try {
-        const generated = await generateStructured(`cardType:summary\n根据以下证据用中文概括事实，不得补充未经证实的数字。返回 signalId、summary、evidenceIds。\n${facts}`, summarySchema);
+        const generated = await generateStructured(`cardType:summary\n根据以下证据用中文概括事实，不得补充未经证实的数字或日期；没有发布时间时不得称为近期发布。返回 signalId、summary、evidenceIds。\n${facts}`, summarySchema);
         if (generated?.signalId !== signal.signalId || !generated.evidenceIds.every((id) => allowed.has(id))) throw new BusinessError(ErrorCodes.CARD_MISSING_EVIDENCE);
         summary = generated.summary;
       } catch (error) {
@@ -60,7 +60,7 @@ export async function generateCards(app: FastifyInstance, taskId: number, deadli
       for (let attempt = 0; attempt < 2 && !saved; attempt++) {
         if (Date.now() >= deadline) { counts.failed++; counts.errorCode ??= ErrorCodes.SCAN_TIMEOUT; break; }
         try {
-          const prompt = `cardType:${kind}\n根据以下可核查事实输出中文 JSON。只引用 evidence 中真实存在的 discoveryId；没有证据支持的判断写入风险或不确定性，不能编造数据。不要写整篇文章或脚本。必须提供所有字段，evidenceIds 至少一个。\n${facts}`;
+          const prompt = `cardType:${kind}\n根据以下可核查事实输出中文 JSON。只引用 evidence 中真实存在的 discoveryId；没有证据支持的判断写入风险或不确定性，不能编造数据或日期；发布时间未知时明确列为待确认。不要写整篇文章或脚本。必须提供所有字段，evidenceIds 至少一个。\n${facts}`;
           const card = await generateStructured(prompt, schema);
           if (!card || card.signalId !== signal.signalId || !card.evidenceIds.every((id: number) => allowed.has(id))) throw new BusinessError(ErrorCodes.CARD_MISSING_EVIDENCE);
           const timestamp = new Date().toISOString();

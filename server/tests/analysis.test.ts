@@ -45,3 +45,23 @@ test('same event groups independent evidence, preserves different events and fla
     await app.close(); db.close(); rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('undated AI discoveries become reviewable signals without pretending the date is verified', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-undated-'));
+  const db = openDatabase(join(directory, 'test.db'));
+  const app = createApp({ db, logger: false, autoRunScans: false });
+  const time = '2026-09-23T12:00:00.000Z';
+  try {
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('undated-test','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run(time).lastInsertRowid);
+    const sourceId = (db.prepare("SELECT source_id sourceId FROM sources WHERE name='OpenAI'").get() as { sourceId: number }).sourceId;
+    const discoveryId = Number(db.prepare("INSERT INTO raw_discoveries(source_id,url,normalized_url,title,snippet,content,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES(?,'https://example.org/undated','https://example.org/undated','AI agent deployed for education','Customer case study', 'Customer case study',?,'undated-hash','candidate',?,?)").run(sourceId, time, time, time).lastInsertRowid);
+    db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,'source',?)").run(taskId, discoveryId, time);
+    assert.equal(analyzeDiscoveries(app, taskId), 1);
+    const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
+    assert.equal(signal.state, 'needs_review');
+    assert.equal(signal.isHighlighted, 0);
+    assert.equal(signal.publishedAtVerified, 0);
+    assert.equal((await app.inject(`/api/signals/${signal.signalId}`)).json().data.scoreExplanation.publishedAtVerified, 0);
+    assert.equal((db.prepare('SELECT status FROM raw_discoveries WHERE discovery_id=?').get(discoveryId) as { status: string }).status, 'candidate');
+  } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
