@@ -1,0 +1,12 @@
+{
+  "name": "ai-intelligence-workbench",
+  "private": true,
+  "packageManager": "pnpm@11.5.0",
+  "scripts": {
+    "dev": "pnpm --parallel --recursive dev",
+    "build": "pnpm --recursive build",
+    "typecheck": "pnpm --recursive typecheck",
+    "test": "pnpm --recursive test",
+    "test:api": "pnpm --filter @ai-intelligence/server test:api"
+  }
+}
