@@ -4,7 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import { Compass, DataAnalysis, Document, FolderOpened, House, List, Plus, Refresh, Search, Star, TrendCharts } from '@element-plus/icons-vue';
 
 type View = 'dashboard' | 'stream' | 'discoveries' | 'trends' | 'opportunities' | 'topics' | 'saved' | 'history' | 'sources';
-type Signal = { signalId: number; title: string; summary: string; valueScore: number; evidenceLevel: string; publishedAtVerified?: number; tags?: string[]; sourceName?: string; saved?: number; ignored?: number; state?: string; valueRating?: number };
+type Signal = { signalId: number; title: string; summary: string; valueScore: number; evidenceLevel: string; evidenceCount?: number; eventAt?: string; isHighlighted?: number; publishedAtVerified?: number; tags?: string[]; sourceName?: string; saved?: number; ignored?: number; state?: string; valueRating?: number };
 const view = ref<View>('dashboard');
 const signals = ref<Signal[]>([]); const records = ref<Record<string, any>[]>([]); const loading = ref(false); const query = ref(''); const scanRange = ref('24h'); const scanStatus = ref(''); const activeTaskId = ref<number | null>(null);
 const progress = ref(0); const discoveredCount = ref(0); const signalCount = ref(0); const opportunityCount = ref(0); const topicCount = ref(0); const starting = ref(false);
@@ -15,10 +15,12 @@ const selectedTaskId = ref<number | null>(null); const scanDates = ref<[Date, Da
 const listStatus = ref(''); const platform = ref(''); const historyStatus = ref(''); const sourceKind = ref(''); const sourceGroup = ref(''); const savedTarget = ref<'signal' | 'opportunity' | 'content_topic'>('signal');
 const sourceDialog = ref(false); const sourceSaving = ref(false); const sourceUrlError = ref('');
 const capabilities = ref<{ anySearch: boolean; llm: boolean } | null>(null); const healthError = ref('');
+const dashboardTrends = ref<Record<string, any>[]>([]); const dashboardOpportunities = ref<Record<string, any>[]>([]); const dashboardTopics = ref<Record<string, any>[]>([]);
+const dashboardLoading = ref(false); const dashboardError = ref(''); const groupEnabled = ref(false); const groupTotal = ref(0); const groupActive = ref(0); const groupLoading = ref(false);
 const lastRequestId = ref(''); let pendingScanKey: string | null = null;
 const newSource = reactive({ name: '', sourceGroup: '新发现候选', kind: 'web', url: '', language: 'mixed', region: 'global', trustLevel: 1, enabled: false, fetchIntervalMinutes: 1440 });
 const detailsOpen = computed({ get: () => details.value !== null, set: (open: boolean) => { if (!open) details.value = null; } });
-let eventSource: EventSource | null = null; let pollTimer: ReturnType<typeof setTimeout> | null = null; let listController: AbortController | null = null; let loadVersion = 0;
+let eventSource: EventSource | null = null; let pollTimer: ReturnType<typeof setTimeout> | null = null; let listController: AbortController | null = null; let loadVersion = 0; let dashboardVersion = 0; let groupStateVersion = 0;
 const nav = [{ key: 'dashboard', label: '今日扫描', icon: House }, { key: 'stream', label: '完整情报流', icon: DataAnalysis }, { key: 'trends', label: '趋势追踪', icon: TrendCharts }, { key: 'opportunities', label: '副业机会', icon: Compass }, { key: 'topics', label: '内容选题', icon: Document }, { key: 'saved', label: '收藏', icon: Star }, { key: 'history', label: '扫描历史', icon: List }, { key: 'sources', label: '来源库', icon: FolderOpened }] as const;
 const title = computed(() => nav.find((item) => item.key === view.value)?.label ?? '原始发现库');
 
@@ -41,7 +43,7 @@ function endpoint() {
 }
 async function loadView(more = false) {
   if (more && (loading.value || !nextCursor.value)) return;
-  if (!more) { nextCursor.value = null; listController?.abort(); if (view.value === 'dashboard' || view.value === 'stream') signals.value = []; else records.value = []; }
+  if (!more) { nextCursor.value = null; listController?.abort(); if (view.value === 'dashboard' || view.value === 'stream') signals.value = []; else records.value = []; if (view.value === 'dashboard') void loadDashboardHighlights(); if (view.value === 'sources') void loadGroupState(); }
   const version = ++loadVersion;
   const controller = new AbortController(); listController = controller;
   loading.value = true;
@@ -52,13 +54,50 @@ async function loadView(more = false) {
     const body = await response.json();
     if (version !== loadVersion) return;
     if (body.code !== 0) throw new Error(`${body.message}（${body.code}，${body.requestId}）`);
-    if (view.value === 'dashboard' || view.value === 'stream') signals.value = more ? [...signals.value, ...body.data.items] : body.data.items;
+    if (view.value === 'dashboard' || view.value === 'stream') {
+      signals.value = more ? [...signals.value, ...body.data.items] : body.data.items;
+      if (view.value === 'dashboard') signals.value.sort((a, b) => Number(b.isHighlighted || 0) - Number(a.isHighlighted || 0));
+    }
     else records.value = more ? [...records.value, ...body.data.items] : body.data.items;
     nextCursor.value = body.data.nextCursor;
   } catch (error) { if (version === loadVersion && !controller.signal.aborted) ElMessage.error(error instanceof Error ? error.message : '数据加载失败'); }
   finally { if (version === loadVersion) loading.value = false; }
 }
 function loadSignals() { return loadView(); }
+async function loadDashboardHighlights() {
+  const version = ++dashboardVersion;
+  dashboardLoading.value = true; dashboardError.value = '';
+  try {
+    const results = await Promise.all(['/api/entities?followed=true&limit=3', '/api/opportunities?limit=3', '/api/content-topics?limit=3'].map(async (path) => {
+      const body = await (await fetch(path)).json();
+      if (body.code !== 0) throw new Error(`${body.message}（${body.code}，${body.requestId}）`);
+      return body.data.items as Record<string, any>[];
+    }));
+    if (version === dashboardVersion && view.value === 'dashboard') [dashboardTrends.value, dashboardOpportunities.value, dashboardTopics.value] = results;
+  } catch (error) { if (version === dashboardVersion && view.value === 'dashboard') dashboardError.value = error instanceof Error ? error.message : '概览获取失败'; }
+  finally { if (version === dashboardVersion) dashboardLoading.value = false; }
+}
+async function fetchAllSources(filter: Record<string, string>) {
+  const items: Record<string, any>[] = []; let cursor: string | null = null;
+  do {
+    const params = new URLSearchParams({ ...filter, limit: '100' }); if (cursor) params.set('cursor', cursor);
+    const body = await (await fetch(`/api/sources?${params}`)).json();
+    if (body.code !== 0) throw new Error(`${body.message}（${body.code}，${body.requestId}）`);
+    items.push(...body.data.items); cursor = body.data.nextCursor;
+  } while (cursor);
+  return items;
+}
+async function loadGroupState() {
+  const group = sourceGroup.value;
+  const version = ++groupStateVersion;
+  groupTotal.value = 0; groupActive.value = 0; groupEnabled.value = false;
+  if (!group) return;
+  try {
+    const rows = await fetchAllSources({ sourceGroup: group });
+    if (version !== groupStateVersion || group !== sourceGroup.value) return;
+    groupTotal.value = rows.length; groupActive.value = rows.filter((row) => Boolean(row.enabled)).length; groupEnabled.value = rows.length > 0 && groupActive.value === rows.length;
+  } catch (error) { if (version === groupStateVersion) ElMessage.error(error instanceof Error ? error.message : '来源组状态获取失败'); }
+}
 async function loadHealth() {
   try {
     const body = await (await fetch('/api/system/health')).json();
@@ -129,8 +168,24 @@ async function createScan() {
 }
 async function toggleSource(row: Record<string, any>) {
   if (row.enabled) { try { await ElMessageBox.confirm(`停用 ${row.name} 后将不再采集该来源。`, '停用来源', { confirmButtonText: '停用', cancelButtonText: '取消' }); } catch { return; } }
-  try { const updated = await requestJson(`/api/sources/${row.sourceId}`, 'PATCH', { enabled: !Boolean(row.enabled) }); row.enabled = updated.enabled; ElMessage.success(row.enabled ? '来源已启用' : '来源已停用'); }
+  if (!row.enabled && row.sourceGroup === '新发现候选') { try { await ElMessageBox.confirm(`确认已核查 ${row.name} 的公开内容和来源可信度？`, '启用新发现来源', { confirmButtonText: '确认启用', cancelButtonText: '取消' }); } catch { return; } }
+  try { const updated = await requestJson(`/api/sources/${row.sourceId}`, 'PATCH', { enabled: !Boolean(row.enabled) }); row.enabled = updated.enabled; ElMessage.success(row.enabled ? '来源已启用' : '来源已停用'); void loadGroupState(); }
   catch (error) { ElMessage.error(error instanceof Error ? error.message : '来源更新失败'); }
+}
+async function toggleSourceGroup(enabled: boolean) {
+  const group = sourceGroup.value;
+  if (!group || group === '新发现候选' || groupLoading.value) return;
+  groupLoading.value = true; let changed = 0;
+  try {
+    const rows = await fetchAllSources({ sourceGroup: group });
+    if (!enabled) {
+      await ElMessageBox.confirm(`停用「${group}」中的 ${rows.filter((row) => row.enabled).length} 个来源？`, '停用来源组', { confirmButtonText: '停用', cancelButtonText: '取消' });
+      if (!capabilities.value?.anySearch && (await fetchAllSources({ enabled: 'true' })).every((row) => row.sourceGroup === group)) throw new Error('至少需要保留一个可用来源或搜索配置（错误码 800003）');
+    }
+    for (const row of rows.filter((row) => Boolean(row.enabled) !== enabled)) { await requestJson(`/api/sources/${row.sourceId}`, 'PATCH', { enabled }); changed++; }
+    ElMessage.success(`「${group}」已${enabled ? '启用' : '停用'} ${changed} 个来源`);
+  } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(`${error instanceof Error ? error.message : '来源组更新失败'}${changed ? `；已更新 ${changed} 个来源，请重试剩余项` : ''}`); }
+  finally { groupLoading.value = false; void loadView(); }
 }
 async function addSource() {
   sourceUrlError.value = '';
@@ -200,7 +255,7 @@ onBeforeUnmount(() => { clearProgressConnection(); listController?.abort(); });
         <div class="section-head"><div><h2>{{ view === 'dashboard' ? '本轮信号' : '完整情报流' }}</h2><span>按证据和价值排序</span></div><div class="section-actions"><el-button @click="go(view === 'dashboard' ? 'stream' : 'discoveries')">{{ view === 'dashboard' ? '完整情报流' : '原始发现' }}</el-button><el-input v-if="view === 'stream'" v-model="query" clearable placeholder="搜索主题、公司或技术" :prefix-icon="Search" @keyup.enter="loadView()" /></div></div>
         <div v-if="view === 'stream'" class="filters"><el-select v-model="signalType" placeholder="全部类型" clearable @change="loadView()"><el-option v-for="type in ['technology','product','paper','funding','company_action','use_case','open_source','market']" :key="type" :label="type" :value="type" /></el-select><el-select v-model="evidenceLevel" placeholder="证据等级" clearable @change="loadView()"><el-option v-for="level in ['single_source','multi_source','first_party','conflicting']" :key="level" :label="level" :value="level" /></el-select><el-segmented v-model="signalSort" :options="[{ label: '价值', value: 'value' }, { label: '最新', value: 'newest' }, { label: '证据', value: 'evidence' }]" @change="loadView()" /></div>
         <el-skeleton v-if="loading && !signals.length" :rows="5" animated /><el-empty v-else-if="!signals.length" description="暂无可核查信号"><el-button @click="go('discoveries')">查看原始发现</el-button></el-empty>
-        <div v-else class="signal-list"><article v-for="signal in (view === 'dashboard' ? signals.slice(0, 5) : signals)" :key="signal.signalId" class="signal"><div class="signal-top"><span class="source">{{ signal.sourceName || '待核查信号' }}</span><el-tag type="success">价值 {{ signal.valueScore }}</el-tag></div><h3>{{ signal.title }}</h3><p>{{ signal.summary }}</p><div class="tags"><el-tag v-for="tag in signal.tags || []" :key="tag" size="small">{{ tag }}</el-tag><el-tag size="small" type="warning">{{ signal.evidenceLevel }}</el-tag><el-tag v-if="signal.publishedAtVerified === 0" size="small" type="warning">时间待核查</el-tag></div><footer><span>#{{ signal.signalId }}</span><div class="record-actions"><el-button :icon="Star" circle :type="signal.saved ? 'warning' : 'default'" title="收藏" @click="updateItemState(signal, 'signal', signal.signalId, { saved: !Boolean(signal.saved) })" /><el-button text type="primary" @click="openDetails('signals', signal.signalId)">查看分析</el-button></div></footer></article></div>
+        <div v-else class="signal-list"><article v-for="signal in (view === 'dashboard' ? signals.slice(0, 5) : signals)" :key="signal.signalId" class="signal"><div class="signal-top"><span class="source">{{ signal.sourceName || '来源待核查' }} · {{ signal.publishedAtVerified === 0 ? '时间待核查' : signal.eventAt || '时间待核查' }}</span><el-tag type="success">价值 {{ signal.valueScore }}</el-tag></div><h3>{{ signal.title }}</h3><p>{{ signal.summary }}</p><div class="tags"><el-tag v-if="signal.isHighlighted" size="small" type="success">重点</el-tag><el-tag v-for="tag in signal.tags || []" :key="tag" size="small">{{ tag }}</el-tag><el-tag size="small" type="info">{{ signal.evidenceCount ?? 0 }} 条证据</el-tag><el-tag size="small" type="warning">{{ signal.evidenceLevel }}</el-tag><el-tag v-if="signal.publishedAtVerified === 0" size="small" type="warning">时间待核查</el-tag></div><footer><span>#{{ signal.signalId }}</span><div class="record-actions"><el-button :icon="Star" circle :type="signal.saved ? 'warning' : 'default'" title="收藏" @click="updateItemState(signal, 'signal', signal.signalId, { saved: !Boolean(signal.saved) })" /><el-button text type="primary" @click="openDetails('signals', signal.signalId)">查看分析</el-button></div></footer></article></div>
         <div v-if="view === 'stream' && nextCursor" class="load-more"><el-button :loading="loading" @click="loadView(true)">加载更多</el-button></div>
       </section>
       <section v-else-if="view === 'discoveries'" class="content-panel"><div class="section-head"><div><h2>原始发现库</h2><span>待核查的发现也会保留</span></div><div class="section-actions"><el-select v-model="discoveryStatus" placeholder="全部状态" clearable style="width:150px" @change="loadView()"><el-option label="候选" value="candidate" /><el-option label="已分析" value="accepted" /><el-option label="范围外" value="rejected" /><el-option label="提取失败" value="extract_failed" /></el-select><el-button @click="go('stream')">返回情报流</el-button></div></div><el-skeleton v-if="loading && !records.length" :rows="5" animated /><el-empty v-else-if="!records.length" description="暂无发现" /><div v-else class="record-list"><article v-for="row in records" :key="row.discoveryId" class="record"><div><span class="record-kicker">{{ row.sourceName || '全网发现' }} · {{ row.publishedAt || '时间待核查' }}</span><h3>{{ row.title }}</h3><p>{{ row.snippet }}</p></div><div class="record-actions"><el-tag :type="row.status === 'accepted' ? 'success' : 'warning'">{{ row.status }}</el-tag><el-button tag="a" :href="row.url" target="_blank" rel="noopener noreferrer" text type="primary">原文</el-button></div></article></div><div v-if="nextCursor" class="load-more"><el-button :loading="loading" @click="loadView(true)">加载更多</el-button></div></section>
@@ -209,7 +264,7 @@ onBeforeUnmount(() => { clearProgressConnection(); listController?.abort(); });
         <div class="filters" v-if="view === 'opportunities' || view === 'topics'"><el-select v-model="listStatus" placeholder="全部状态" clearable @change="loadView()"><el-option v-for="status in (view === 'opportunities' ? ['candidate','prepare_verification','verified'] : ['candidate','preparing','published'])" :key="status" :label="status" :value="status" /></el-select><el-select v-if="view === 'topics'" v-model="platform" placeholder="全部平台" clearable @change="loadView()"><el-option v-for="site in ['wechat','video_account','xiaohongshu','zhihu','bilibili','douyin','x','newsletter']" :key="site" :label="site" :value="site" /></el-select></div>
         <div class="filters" v-if="view === 'saved'"><el-segmented v-model="savedTarget" :options="[{ label: '情报', value: 'signal' }, { label: '副业机会', value: 'opportunity' }, { label: '内容选题', value: 'content_topic' }]" @change="loadView()" /></div>
         <div class="filters" v-if="view === 'history'"><el-select v-model="historyStatus" placeholder="全部任务" clearable @change="loadView()"><el-option v-for="status in ['created','collecting','normalizing','clustering','analyzing','generating','completed','partial_failed','failed']" :key="status" :label="stepLabels[status] || status" :value="status" /></el-select></div>
-        <div class="filters" v-if="view === 'sources'"><el-select v-model="sourceGroup" placeholder="全部来源组" clearable @change="loadView()"><el-option v-for="group in ['国际官方','国内官方','研究开源','科技媒体','新发现候选']" :key="group" :label="group" :value="group" /></el-select><el-select v-model="sourceKind" placeholder="全部类型" clearable @change="loadView()"><el-option v-for="kind in ['rss','api','web']" :key="kind" :label="kind" :value="kind" /></el-select></div>
+        <div class="filters" v-if="view === 'sources'"><el-select v-model="sourceGroup" placeholder="全部来源组" clearable @change="loadView()"><el-option v-for="group in ['国际官方','国内官方','研究开源','科技媒体','新发现候选']" :key="group" :label="group" :value="group" /></el-select><el-select v-model="sourceKind" placeholder="全部类型" clearable @change="loadView()"><el-option v-for="kind in ['rss','api','web']" :key="kind" :label="kind" :value="kind" /></el-select><span v-if="sourceGroup" class="group-toggle"><span>启用来源组 · {{ groupActive }}/{{ groupTotal }}</span><el-tooltip :content="sourceGroup === '新发现候选' ? '新发现来源需逐条审核启用' : '启用或停用当前来源组'" placement="top"><span><el-switch :model-value="groupEnabled" :loading="groupLoading" :disabled="sourceGroup === '新发现候选' || groupTotal === 0" @change="toggleSourceGroup" /></span></el-tooltip></span></div>
         <el-skeleton v-if="loading && !records.length" :rows="5" animated /><el-empty v-else-if="!records.length" :description="`${title}暂无结果`"><el-button v-if="view !== 'sources'" type="primary" @click="go('dashboard')">今日扫描</el-button></el-empty>
         <div v-else class="record-list"><article v-for="row in records" :key="row.sourceId || row.entityId || row.opportunityId || row.contentTopicId || row.taskId || row.signalId" class="record"><div><span class="record-kicker">{{ view === 'sources' ? row.sourceGroup : view === 'history' ? `任务 #${row.taskId}` : view === 'trends' ? row.entityType : view === 'opportunities' ? '副业机会' : view === 'topics' ? '内容选题' : '情报' }}</span><h3>{{ row.name || row.title || row.coreViewpoint || `扫描任务 ${row.taskId}` }}</h3><p>{{ row.summary || row.coreViewpoint || (view === 'history' ? `${row.discoveredCount ?? 0} 条发现 · ${row.signalCount ?? 0} 条信号` : row.url || '') }}</p></div>
           <div class="record-actions"><el-tag v-if="view === 'sources'" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '已启用' : '已停用' }}</el-tag><el-tag v-else>{{ stepLabels[row.status] || row.status || row.evidenceLevel || '可查看' }}</el-tag>
@@ -218,6 +273,12 @@ onBeforeUnmount(() => { clearProgressConnection(); listController?.abort(); });
             <template v-else-if="view === 'trends'"><el-button :icon="Star" circle :type="row.followed ? 'warning' : 'default'" :title="row.followed ? '取消关注' : '关注'" @click="followEntity(row)" /><el-button text type="primary" @click="openDetails('entities', row.entityId)">时间线</el-button></template>
             <template v-else><el-button :icon="Star" circle :type="row.saved ? 'warning' : 'default'" title="收藏" @click="updateItemState(row, row.opportunityId ? 'opportunity' : row.contentTopicId ? 'content_topic' : 'signal', row.opportunityId || row.contentTopicId || row.signalId, { saved: !Boolean(row.saved) })" /><el-select v-if="row.opportunityId || row.contentTopicId" :model-value="row.status" size="small" class="status-select" @change="(value: string) => setCardStatus(row, row.opportunityId ? 'opportunities' : 'content-topics', value)"><el-option v-for="status in (row.opportunityId ? ['candidate','prepare_verification','verified'] : ['candidate','preparing','published'])" :key="status" :label="status" :value="status" /></el-select><el-button text type="primary" @click="openDetails(row.opportunityId ? 'opportunities' : row.contentTopicId ? 'content-topics' : 'signals', row.opportunityId || row.contentTopicId || row.signalId)">查看详情</el-button></template>
           </div></article></div><div v-if="nextCursor" class="load-more"><el-button :loading="loading" @click="loadView(true)">加载更多</el-button></div>
+      </section>
+      <section v-if="view === 'dashboard'" class="dashboard-extras">
+        <el-alert v-if="dashboardError" :title="dashboardError" type="error" show-icon @close="dashboardError = ''" />
+        <div class="dashboard-column"><div class="dashboard-column-head"><h2>关注趋势</h2><el-button text type="primary" @click="go('trends')">查看全部</el-button></div><el-skeleton v-if="dashboardLoading" :rows="3" animated /><el-empty v-else-if="!dashboardTrends.length" description="暂无关注趋势" /><button v-for="row in dashboardTrends" :key="row.entityId" class="dashboard-row" @click="openDetails('entities', row.entityId)"><strong>{{ row.name }}</strong><small>{{ row.signalCount }} 条信号 · {{ row.latestEvent?.headline || '暂无事件' }}</small></button></div>
+        <div class="dashboard-column"><div class="dashboard-column-head"><h2>副业机会</h2><el-button text type="primary" @click="go('opportunities')">查看全部</el-button></div><el-skeleton v-if="dashboardLoading" :rows="3" animated /><el-empty v-else-if="!dashboardOpportunities.length" description="暂无机会" /><button v-for="row in dashboardOpportunities" :key="row.opportunityId" class="dashboard-row" @click="openDetails('opportunities', row.opportunityId)"><strong>{{ row.title }}</strong><small>{{ row.summary }}</small></button></div>
+        <div class="dashboard-column"><div class="dashboard-column-head"><h2>内容选题</h2><el-button text type="primary" @click="go('topics')">查看全部</el-button></div><el-skeleton v-if="dashboardLoading" :rows="3" animated /><el-empty v-else-if="!dashboardTopics.length" description="暂无选题" /><button v-for="row in dashboardTopics" :key="row.contentTopicId" class="dashboard-row" @click="openDetails('content-topics', row.contentTopicId)"><strong>{{ row.title }}</strong><small>{{ row.coreViewpoint }}</small></button></div>
       </section>
       <el-drawer v-model="detailsOpen" :title="details?.title || details?.name || `任务 #${details?.taskId || ''}`" size="min(560px, 100%)" :with-header="true">
         <el-skeleton v-if="detailsLoading" :rows="7" animated />

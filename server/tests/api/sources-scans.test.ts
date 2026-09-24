@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createApp } from '../../src/app.js';
 import { openDatabase } from '../../src/persistence/database.js';
 import { BusinessError, ErrorCodes } from '../../src/domain/errorCodes.js';
+import { AnySearchClient } from '../../src/ingestion/AnySearchClient.js';
 
 async function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'ai-intelligence-'));
@@ -42,6 +43,24 @@ test('API-23 rejects an unreachable source without writing it', async () => {
     assert.equal(response.statusCode, 502);
     assert.equal(response.json().code, 800007);
     assert.equal(db.prepare('SELECT 1 FROM sources WHERE url=?').get('https://example.org/absent'), undefined);
+  } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('API-20 protects the last enabled source unless full-web search is configured', async () => {
+  const { app, db, directory } = await fixture();
+  try {
+    db.prepare('UPDATE sources SET enabled=0 WHERE source_id!=1').run();
+    app.searchClient = null;
+    const blocked = await app.inject({ method: 'PATCH', url: '/api/sources/1', payload: { enabled: false } });
+    assert.equal(blocked.statusCode, 409);
+    assert.equal(blocked.json().code, 800003);
+    assert.equal((db.prepare('SELECT enabled FROM sources WHERE source_id=1').get() as { enabled: number }).enabled, 1);
+
+    app.searchClient = new AnySearchClient('https://example.org', 'test-key');
+    const allowed = await app.inject({ method: 'PATCH', url: '/api/sources/1', payload: { enabled: false } });
+    assert.equal(allowed.statusCode, 200);
+    assert.equal(allowed.json().data.enabled, 0);
+    assert.equal((db.prepare('SELECT count(*) count FROM sources WHERE enabled=1').get() as { count: number }).count, 0);
   } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

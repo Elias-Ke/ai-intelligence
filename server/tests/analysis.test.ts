@@ -61,6 +61,8 @@ test('undated AI discoveries become reviewable signals without pretending the da
     assert.equal(signal.state, 'needs_review');
     assert.equal(signal.isHighlighted, 0);
     assert.equal(signal.publishedAtVerified, 0);
+    assert.equal(signal.sourceName, 'OpenAI');
+    assert.equal(signal.evidenceCount, 1);
     assert.equal((await app.inject(`/api/signals/${signal.signalId}`)).json().data.scoreExplanation.publishedAtVerified, 0);
     assert.equal((db.prepare('SELECT status FROM raw_discoveries WHERE discovery_id=?').get(discoveryId) as { status: string }).status, 'candidate');
   } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }

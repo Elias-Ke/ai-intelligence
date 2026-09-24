@@ -67,7 +67,7 @@ export function registerSourceRoutes(app: FastifyInstance) {
     if (!source) throw new BusinessError(ErrorCodes.SOURCE_NOT_FOUND);
     if (!body.enabled && source.enabled === 1) {
       const remaining = app.db.prepare('SELECT count(*) count FROM sources WHERE enabled = 1 AND source_id != ?').get(id) as { count: number };
-      if (remaining.count === 0) throw new BusinessError(ErrorCodes.LAST_SOURCE);
+      if (remaining.count === 0 && !app.searchClient) throw new BusinessError(ErrorCodes.LAST_SOURCE);
     }
     app.db.prepare('UPDATE sources SET enabled = ?, updated_at = ? WHERE source_id = ?').run(body.enabled ? 1 : 0, now(), id);
     const row = app.db.prepare('SELECT source_id sourceId,name,source_group sourceGroup,kind,url,language,region,trust_level trustLevel,enabled,fetch_interval_minutes fetchIntervalMinutes,last_checked_at lastCheckedAt,last_success_at lastSuccessAt,last_error_code lastErrorCode FROM sources WHERE source_id = ?').get(id);
