@@ -33,7 +33,7 @@ export async function generateCards(app: FastifyInstance, taskId: number, deadli
     const allowed = new Set(evidence.map(({ discoveryId }) => discoveryId));
     const facts = JSON.stringify({ signalId: signal.signalId, title: signal.title, summary: signal.summary, evidence: evidence.map(({ discoveryId, title, url, snippet, publishedAt }) => ({ discoveryId, title, url, snippet: snippet.slice(0, 300), publishedAt })) });
     const fallback = `原文标题：${signal.title}。已记录 ${evidence.length} 条来源，${evidence.every(({ publishedAt }) => !publishedAt) ? '发布时间待核查，' : ''}具体变化请核查原文。`;
-    let summary = fallback;
+    let summary = signal.summary || fallback;
     if (configured) {
       try {
         const generated = await generateStructured(`cardType:summary\n根据以下证据用中文概括事实，不得补充未经证实的数字或日期；没有发布时间时不得称为近期发布。返回 signalId、summary、evidenceIds。\n${facts}`, summarySchema);

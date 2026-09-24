@@ -21,12 +21,13 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   db.prepare("INSERT INTO signal_sources(signal_id,discovery_id,relation_type,added_at) VALUES(?,?,'primary',?)").run(signalId, discoveryId, time);
   let opportunityCalls = 0;
   let forceInvalid = false;
+  let forceSummaryInvalid = false;
   const previousFetch = globalThis.fetch;
   globalThis.fetch = (async (input, init) => {
     if (!String(input).startsWith('http://model.test/')) return previousFetch(input, init);
     const body = JSON.parse(String(init?.body)) as { messages: { content: string }[] };
     const isOpportunity = body.messages[1]?.content.startsWith('cardType:opportunity');
-    const card = body.messages[1]?.content.startsWith('cardType:summary') ? { signalId, summary: '公开案例显示 AI 已进入实际部署，需要进一步核验客户数据', evidenceIds: [discoveryId] } : isOpportunity ? opportunity(forceInvalid || ++opportunityCalls === 1 ? 99999 : discoveryId, signalId) : topic(forceInvalid ? 99999 : discoveryId, signalId);
+    const card = body.messages[1]?.content.startsWith('cardType:summary') ? { signalId, summary: forceSummaryInvalid ? '' : '公开案例显示 AI 已进入实际部署，需要进一步核验客户数据', evidenceIds: [discoveryId] } : isOpportunity ? opportunity(forceInvalid || ++opportunityCalls === 1 ? 99999 : discoveryId, signalId) : topic(forceInvalid ? 99999 : discoveryId, signalId);
     return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(card) } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
   }) as typeof fetch;
   const previous = { base: process.env.LLM_BASE_URL, key: process.env.LLM_API_KEY, model: process.env.LLM_MODEL };
@@ -56,8 +57,15 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   db.prepare('UPDATE signals SET monetization_score=60,adoption_score=60 WHERE signal_id=?').run(signalId);
   delete process.env.LLM_MODEL;
   assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 0, failed: 2, errorCode: 910004 });
+  assert.match((db.prepare('SELECT summary FROM signals WHERE signal_id=?').get(signalId) as { summary: string }).summary, /实际部署/);
+  db.prepare("UPDATE signals SET summary='' WHERE signal_id=?").run(signalId);
+  await generateCards(app, taskId);
   assert.match((db.prepare('SELECT summary FROM signals WHERE signal_id=?').get(signalId) as { summary: string }).summary, /原文标题/);
   process.env.LLM_MODEL = 'test-model';
+  forceSummaryInvalid = true;
+  await generateCards(app, taskId);
+  assert.match((db.prepare('SELECT summary FROM signals WHERE signal_id=?').get(signalId) as { summary: string }).summary, /原文标题/);
+  forceSummaryInvalid = false;
   assert.equal((db.prepare('SELECT count(*) count FROM content_topics').get() as { count: number }).count, 1);
   assert.equal((db.prepare('SELECT status FROM opportunities').get() as { status: string }).status, 'verified');
   forceInvalid = true;
