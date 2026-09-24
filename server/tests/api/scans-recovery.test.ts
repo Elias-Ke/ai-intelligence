@@ -36,3 +36,36 @@ test('startup recovery preserves discoveries, closes running steps, and permits 
     await app.close(); db.close(); rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('retry keys and original resume steps remain idempotent after database reopen', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-retry-persist-'));
+  const path = join(directory, 'test.db');
+  let db = openDatabase(path);
+  const timestamp = new Date().toISOString();
+  const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,current_step,created_at,started_at,finished_at) VALUES('persist-create','2026-09-22','2026-09-24','failed','generating',?,?,?)").run(timestamp, timestamp, timestamp).lastInsertRowid);
+  db.prepare("INSERT INTO scan_task_steps(task_id,step_name,status) VALUES(?,'generating','failed')").run(taskId);
+  const key = 'persist-retry-one';
+  const firstApp = createApp({ db, logger: false, autoRunScans: false });
+  try {
+    const first = await firstApp.inject({ method: 'POST', url: `/api/scans/${taskId}/retry`, headers: { 'idempotency-key': key } });
+    assert.equal(first.statusCode, 202);
+    assert.equal(first.json().data.resumeFromStep, 'generating');
+    assert.equal((await firstApp.inject({ method: 'POST', url: `/api/scans/${taskId}/retry`, headers: { 'idempotency-key': 'different' } })).json().code, 200003);
+  } finally { await firstApp.close(); db.close(); }
+
+  db = openDatabase(path);
+  const secondApp = createApp({ db, logger: false, autoRunScans: false });
+  try {
+    assert.deepEqual(recoverInterruptedScans(db), [taskId]);
+    const replay = await secondApp.inject({ method: 'POST', url: `/api/scans/${taskId}/retry`, headers: { 'idempotency-key': key } });
+    assert.equal(replay.statusCode, 200);
+    assert.equal(replay.json().data.resumeFromStep, 'generating');
+    assert.equal((db.prepare('SELECT count(*) count FROM scan_retry_requests WHERE task_id=?').get(taskId) as { count: number }).count, 1);
+    const next = await secondApp.inject({ method: 'POST', url: `/api/scans/${taskId}/retry`, headers: { 'idempotency-key': 'persist-retry-two' } });
+    assert.equal(next.statusCode, 202);
+    const historicalReplay = await secondApp.inject({ method: 'POST', url: `/api/scans/${taskId}/retry`, headers: { 'idempotency-key': key } });
+    assert.equal(historicalReplay.statusCode, 200);
+    assert.equal(historicalReplay.json().data.resumeFromStep, 'generating');
+    assert.equal((db.prepare('SELECT count(*) count FROM scan_retry_requests WHERE task_id=?').get(taskId) as { count: number }).count, 2);
+  } finally { await secondApp.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});

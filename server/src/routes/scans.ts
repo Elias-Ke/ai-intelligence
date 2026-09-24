@@ -195,7 +195,6 @@ function scheduleScan(app: FastifyInstance, taskId: number) {
 }
 
 export function registerScanRoutes(app: FastifyInstance) {
-  const retryKeys = new Map<number, string>();
   app.post('/api/scans', async (request, reply) => {
     const key = request.headers['idempotency-key'];
     if (typeof key !== 'string' || key.length < 1 || key.length > 100) throw new BusinessError(ErrorCodes.MISSING_IDEMPOTENCY_KEY);
@@ -253,13 +252,16 @@ export function registerScanRoutes(app: FastifyInstance) {
     if (!row) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
     const failedStep = app.db.prepare("SELECT step_name stepName FROM scan_task_steps WHERE task_id=? AND status IN ('partial_failed','failed') ORDER BY rowid LIMIT 1").get(id) as { stepName: Step } | undefined;
     const resumeFromStep = failedStep?.stepName ?? 'collecting';
-    if (retryKeys.get(id) === key) return reply.send({ code: 0, message: 'success', data: { taskId: id, status: row.status, resumeFromStep, reused: true }, requestId: request.id });
-    if (row.status === 'retrying' && retryKeys.has(id)) throw new BusinessError(ErrorCodes.IDEMPOTENCY_CONFLICT);
+    const existingRetry = app.db.prepare('SELECT resume_from_step resumeFromStep FROM scan_retry_requests WHERE task_id=? AND idempotency_key=?').get(id, key) as { resumeFromStep: Step } | undefined;
+    if (existingRetry) return reply.send({ code: 0, message: 'success', data: { taskId: id, status: row.status, resumeFromStep: existingRetry.resumeFromStep, reused: true }, requestId: request.id });
+    if (row.status === 'retrying') throw new BusinessError(ErrorCodes.IDEMPOTENCY_CONFLICT);
     if (!['failed', 'partial_failed'].includes(String(row.status))) throw new BusinessError(ErrorCodes.RETRY_NOT_ALLOWED);
     const active = app.db.prepare(`SELECT task_id FROM scan_tasks WHERE status IN (${activeStatuses.map(() => '?').join(',')}) LIMIT 1`).get(...activeStatuses);
     if (active) throw new BusinessError(ErrorCodes.ACTIVE_SCAN_EXISTS);
-    app.db.prepare("UPDATE scan_tasks SET status='retrying',error_code=NULL,error_message=NULL,finished_at=NULL WHERE task_id=?").run(id);
-    retryKeys.set(id, key);
+    app.db.transaction(() => {
+      app.db.prepare('INSERT INTO scan_retry_requests(task_id,idempotency_key,resume_from_step,created_at) VALUES(?,?,?,?)').run(id, key, resumeFromStep, now());
+      app.db.prepare("UPDATE scan_tasks SET status='retrying',error_code=NULL,error_message=NULL,finished_at=NULL WHERE task_id=?").run(id);
+    })();
     app.taskEvents.emit('changed', id);
     scheduleScan(app, id);
     app.log.info({ event: 'scan.task.retried', taskId: id, resumeFromStep, businessCode: 0 }, 'scan task scheduled for retry');
