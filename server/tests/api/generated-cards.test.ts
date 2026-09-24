@@ -1,0 +1,64 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { createServer } from 'node:http';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createApp } from '../../src/app.js';
+import { generateCards } from '../../src/generation/cards.js';
+import { openDatabase } from '../../src/persistence/database.js';
+
+const opportunity = (id: number) => ({ title: 'AI 服务实施机会', summary: '围绕有证据的实际部署提供实施服务', targetUsers: '企业团队', problem: '部署流程需要集成', alternatives: ['现有内部流程'], timingReason: '出现实际案例', solutionForm: '实施服务', deliveryDifficulty: '中', acquisitionDifficulty: '中', monetization: '按项目收费，待验证', validationAction: '访谈目标团队', risks: ['单一来源'], openQuestions: ['客户是否愿意付费'], evidenceIds: [id] });
+const topic = (id: number) => ({ title: 'AI 落地背后的技术变化', coreViewpoint: '讨论真实部署证据及限制', coreFacts: ['已有公开部署报道'], background: '行业部署背景', technologyChange: '集成流程变化', useCases: ['企业服务'], arguments: ['有实践依据'], controversies: ['缺少独立核验'], uncertainties: ['尚无客户数量数据'], platformAngles: { zhihu: '拆解实施过程', bilibili: '展示技术路径' }, evidenceIds: [id] });
+
+test('cards retry invalid evidence once, persist traceable details, and update without duplication', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-cards-'));
+  const db = openDatabase(join(directory, 'test.db'));
+  const time = '2026-09-23T12:00:00.000Z';
+  const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('cards-test','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run(time).lastInsertRowid);
+  const discoveryId = Number(db.prepare("INSERT INTO raw_discoveries(url,normalized_url,title,snippet,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES('https://example.org/case','https://example.org/case','AI deployment','Public example',?,'case-hash','accepted',?,?)").run(time, time, time).lastInsertRowid);
+  const signalId = Number(db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,has_conflict,rules_version,state,event_at,created_at,updated_at) VALUES('card-cluster','AI 部署案例','公开报道','use_case',65,65,70,50,70,60,65,64,'first_party',0,'v1','active',?,?,?)").run(time, time, time).lastInsertRowid);
+  db.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,created_at) VALUES(?,?,1,?)').run(taskId, signalId, time);
+  db.prepare("INSERT INTO signal_sources(signal_id,discovery_id,relation_type,added_at) VALUES(?,?,'primary',?)").run(signalId, discoveryId, time);
+  let opportunityCalls = 0;
+  let forceInvalid = false;
+  const model = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { messages: { content: string }[] };
+      const isOpportunity = body.messages[1]?.content.startsWith('cardType:opportunity');
+      const card = isOpportunity ? opportunity(forceInvalid || ++opportunityCalls === 1 ? 99999 : discoveryId) : topic(forceInvalid ? 99999 : discoveryId);
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(card) } }] }));
+    });
+  });
+  await new Promise<void>((resolve) => model.listen(0, '127.0.0.1', resolve));
+  const address = model.address(); assert.ok(address && typeof address !== 'string');
+  const previous = { base: process.env.LLM_BASE_URL, key: process.env.LLM_API_KEY, model: process.env.LLM_MODEL };
+  process.env.LLM_BASE_URL = `http://127.0.0.1:${address.port}`; process.env.LLM_API_KEY = 'test-key'; process.env.LLM_MODEL = 'test-model';
+  const app = createApp({ db, logger: false, autoRunScans: false });
+  t.after(async () => {
+    await app.close(); await new Promise<void>((resolve) => model.close(() => resolve())); db.close(); rmSync(directory, { recursive: true, force: true });
+    for (const [key, value] of Object.entries({ LLM_BASE_URL: previous.base, LLM_API_KEY: previous.key, LLM_MODEL: previous.model })) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  });
+  const first = await generateCards(app, taskId);
+  assert.deepEqual(first, { opportunities: 1, topics: 1, failed: 0, errorCode: null });
+  assert.equal(opportunityCalls, 2);
+  const opportunityId = (db.prepare('SELECT opportunity_id id FROM opportunities').get() as { id: number }).id;
+  const opportunityDetail = (await app.inject(`/api/opportunities/${opportunityId}`)).json();
+  assert.equal(opportunityDetail.data.evidence[0].discoveryId, discoveryId);
+  assert.deepEqual(opportunityDetail.data.risks, ['单一来源']);
+  const topicId = (db.prepare('SELECT content_topic_id id FROM content_topics').get() as { id: number }).id;
+  const topicDetail = (await app.inject(`/api/content-topics/${topicId}`)).json();
+  assert.equal(topicDetail.data.evidence[0].url, 'https://example.org/case');
+  assert.deepEqual(topicDetail.data.platforms, ['zhihu', 'bilibili']);
+  await app.inject({ method: 'PATCH', url: `/api/opportunities/${opportunityId}/status`, payload: { status: 'verified' } });
+  await generateCards(app, taskId);
+  assert.equal((db.prepare('SELECT count(*) count FROM opportunities').get() as { count: number }).count, 1);
+  assert.equal((db.prepare('SELECT count(*) count FROM content_topics').get() as { count: number }).count, 1);
+  assert.equal((db.prepare('SELECT status FROM opportunities').get() as { status: string }).status, 'verified');
+  forceInvalid = true;
+  assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 0, failed: 2, errorCode: 910003 });
+  assert.equal((db.prepare('SELECT count(*) count FROM opportunities').get() as { count: number }).count, 1);
+});

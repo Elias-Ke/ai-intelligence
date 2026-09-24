@@ -15,7 +15,11 @@ function llmConfig() {
   return parsed.success ? parsed.data : null;
 }
 
-export async function generateStructured(prompt: string, schema = structuredCardSchema): Promise<StructuredCard | null> {
+export function hasLlmConfig() { return llmConfig() !== null; }
+
+export function generateStructured(prompt: string): Promise<StructuredCard | null>;
+export function generateStructured<T extends z.ZodType>(prompt: string, schema: T): Promise<z.output<T> | null>;
+export async function generateStructured(prompt: string, schema: z.ZodType = structuredCardSchema): Promise<unknown | null> {
   const config = llmConfig();
   if (!config) return null;
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 15000);
@@ -29,7 +33,7 @@ export async function generateStructured(prompt: string, schema = structuredCard
     try { value = JSON.parse(content); } catch { throw new BusinessError(ErrorCodes.LLM_INVALID_RESPONSE); }
     const parsed = schema.safeParse(value);
     if (!parsed.success) throw new BusinessError(ErrorCodes.LLM_INVALID_RESPONSE, { fields: parsed.error.issues.map((issue) => issue.path.join('.')) });
-    return parsed.data as StructuredCard;
+    return parsed.data;
   } catch (error) {
     if (error instanceof BusinessError) throw error;
     if (error instanceof Error && error.name === 'AbortError') throw new BusinessError(ErrorCodes.LLM_TIMEOUT);

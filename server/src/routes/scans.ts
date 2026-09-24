@@ -6,6 +6,7 @@ import { parseSource } from '../ingestion/parseSource.js';
 import { publicUrl } from '../ingestion/publicHttp.js';
 import { buildSearchQueries, QUERY_VERSION } from '../ingestion/searchQueries.js';
 import { scoreDiscovery } from '../domain/scoring.js';
+import { generateCards } from '../generation/cards.js';
 
 const activeStatuses = ['created', 'collecting', 'normalizing', 'clustering', 'analyzing', 'generating', 'retrying'];
 function rangeWindow(body: Record<string, unknown>) {
@@ -111,10 +112,15 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     app.db.prepare("INSERT OR IGNORE INTO signal_sources(signal_id,discovery_id,relation_type,is_independent,added_at) VALUES(?,?,?,?,?)").run(signal.signalId, discovery.discovery_id, 'primary', 1, timestamp);
     app.log.info({ event: 'analysis.signal.scored', taskId, signalId: signal.signalId, discoveryId: discovery.discovery_id, rulesVersion: 'v1', relevanceScore: assessment.relevance, valueScore: assessment.value, evidenceCount: 1 }, 'signal scored');
   }
-  const finalStatus = failed && discovered ? 'partial_failed' : failed ? 'failed' : 'completed';
-  app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,signal_count=?,opportunity_count=?,content_topic_count=?,error_code=?,error_message=?,finished_at=?,heartbeat_at=? WHERE task_id=?').run(finalStatus, 'generating', 100, discovered, signals, 0, 0, scanErrorCode, scanErrorCode === null ? null : new BusinessError(scanErrorCode as never).message, now(), now(), taskId);
+  app.db.prepare("UPDATE scan_tasks SET status='generating',current_step='generating',progress=85,signal_count=?,heartbeat_at=? WHERE task_id=?").run(signals, now(), taskId);
   app.taskEvents.emit('changed', taskId);
-  app.log.info({ event: finalStatus === 'completed' ? 'scan.task.completed' : 'scan.task.partial_failed', taskId, discovered, signals, opportunities: 0, topics: 0, failed }, 'scan task finished');
+  const generated = await generateCards(app, taskId);
+  failed += generated.failed;
+  scanErrorCode ??= generated.errorCode;
+  const finalStatus = failed && discovered ? 'partial_failed' : failed ? 'failed' : 'completed';
+  app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,signal_count=?,opportunity_count=?,content_topic_count=?,error_code=?,error_message=?,finished_at=?,heartbeat_at=? WHERE task_id=?').run(finalStatus, 'generating', 100, discovered, signals, generated.opportunities, generated.topics, scanErrorCode, scanErrorCode === null ? null : new BusinessError(scanErrorCode as never).message, now(), now(), taskId);
+  app.taskEvents.emit('changed', taskId);
+  app.log.info({ event: finalStatus === 'completed' ? 'scan.task.completed' : 'scan.task.partial_failed', taskId, discovered, signals, opportunities: generated.opportunities, topics: generated.topics, failed }, 'scan task finished');
 }
 
 export async function runScan(app: FastifyInstance, taskId: number) {
