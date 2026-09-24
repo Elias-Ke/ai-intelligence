@@ -31,6 +31,23 @@ test('production migration creates the documented indexes and preserves state on
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('production migration adds scan status snapshots to an existing database only once', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'intelligence-legacy-')); const path = join(directory, 'main.db');
+  try {
+    const old = openDatabase(path);
+    old.exec('ALTER TABLE scan_discoveries DROP COLUMN status; ALTER TABLE scan_discoveries DROP COLUMN rejection_reason');
+    old.close();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const db = openDatabase(path);
+      try {
+        const columns = db.pragma('table_info(scan_discoveries)') as { name: string }[];
+        assert.equal(columns.filter(({ name }) => name === 'status' || name === 'rejection_reason').length, 2);
+        assert.throws(() => db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,status,discovered_at) VALUES(1,1,'source','wrong',?)").run(new Date().toISOString()));
+      } finally { db.close(); }
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('state changes emit safe correlated events only after successful writes', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'intelligence-logs-')); const db = openDatabase(join(directory, 'main.db'));
   const app = createApp({ db, logger: false, autoRunScans: false });

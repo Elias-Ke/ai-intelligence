@@ -8,7 +8,13 @@ export function openDatabase(path: string): SqliteDatabase {
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('busy_timeout = 5000');
-  try { db.transaction(() => { db.exec(schemaSql); seedSources(db); })(); }
+  try { db.transaction(() => {
+    db.exec(schemaSql);
+    const columns = new Set((db.pragma('table_info(scan_discoveries)') as { name: string }[]).map(({ name }) => name));
+    if (!columns.has('status')) db.exec("ALTER TABLE scan_discoveries ADD COLUMN status TEXT CHECK(status IN ('candidate','accepted','rejected','extract_failed'))");
+    if (!columns.has('rejection_reason')) db.exec('ALTER TABLE scan_discoveries ADD COLUMN rejection_reason TEXT');
+    seedSources(db);
+  })(); }
   catch (error) { db.close(); throw error; }
   return db;
 }

@@ -59,9 +59,13 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     if (publishedAt) app.db.prepare("UPDATE raw_discoveries SET published_at=?,published_at_verified=1,status=?,rejection_reason=?,last_seen_at=? WHERE discovery_id=? AND published_at_verified=0").run(publishedAt, status, status === 'rejected' ? 'outside_scan_range' : null, timestamp, row.discoveryId);
     if (inRange && publishedAt) app.db.prepare("UPDATE raw_discoveries SET status=?,rejection_reason=?,last_seen_at=? WHERE discovery_id=? AND status='rejected'").run(extractionFailed ? 'extract_failed' : 'accepted', extractionFailed ? 'extraction_failed' : null, timestamp, row.discoveryId);
     if (inRange && !extractionFailed) app.db.prepare("UPDATE raw_discoveries SET status=?,rejection_reason=NULL,last_seen_at=? WHERE discovery_id=? AND status='extract_failed'").run(publishedAt ? 'accepted' : 'candidate', timestamp, row.discoveryId);
-    const linked = app.db.prepare('SELECT discovery_channel FROM scan_discoveries WHERE task_id=? AND discovery_id=?').get(taskId, row.discoveryId) as { discovery_channel: string } | undefined;
-    if (linked) app.db.prepare("UPDATE scan_discoveries SET discovery_channel=? WHERE task_id=? AND discovery_id=?").run(linked.discovery_channel === channel ? channel : 'both', taskId, row.discoveryId);
-    else app.db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,?,?)").run(taskId, row.discoveryId, channel, timestamp);
+    const stored = app.db.prepare('SELECT published_at publishedAt FROM raw_discoveries WHERE discovery_id=?').get(row.discoveryId) as { publishedAt: string | null };
+    const dated = stored.publishedAt;
+    const scanStatus = dated && (new Date(dated) < rangeFrom || new Date(dated) > rangeTo) ? 'rejected' : extractionFailed ? 'extract_failed' : dated ? 'accepted' : 'candidate';
+    const reason = scanStatus === 'rejected' ? 'outside_scan_range' : scanStatus === 'extract_failed' ? 'extraction_failed' : null;
+    const linked = app.db.prepare('SELECT discovery_channel,status FROM scan_discoveries WHERE task_id=? AND discovery_id=?').get(taskId, row.discoveryId) as { discovery_channel: string; status: string | null } | undefined;
+    if (linked) app.db.prepare('UPDATE scan_discoveries SET discovery_channel=?,status=?,rejection_reason=? WHERE task_id=? AND discovery_id=?').run(linked.discovery_channel === channel ? channel : 'both', linked.status === 'accepted' ? 'accepted' : scanStatus, linked.status === 'accepted' ? null : reason, taskId, row.discoveryId);
+    else app.db.prepare('INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,status,rejection_reason,discovered_at) VALUES(?,?,?,?,?,?)').run(taskId, row.discoveryId, channel, scanStatus, reason, timestamp);
     return { discoveryId: row.discoveryId, isNew: !linked };
   });
   if (fromIndex <= 0) setStep(app, taskId, 'collecting', 'running', discovered);
