@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { isFirstPartyArticle } from './scoring.js';
 
 type EntityType = 'company' | 'product' | 'technology' | 'topic' | 'industry' | 'problem';
 type EntityInput = { type: EntityType; name: string; role: 'primary' | 'mentioned' | 'affected' };
@@ -32,12 +33,20 @@ export function identifyEntities(title: string, summary: string, sourceName: str
 }
 
 export function updateTrends(app: FastifyInstance, taskId: number) {
-  const signals = app.db.prepare("SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.event_at eventAt,src.name sourceName,src.trust_level sourceTrust FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id LEFT JOIN signal_sources ev ON ev.signal_id=s.signal_id AND ev.relation_type='primary' LEFT JOIN raw_discoveries d ON d.discovery_id=ev.discovery_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE ss.task_id=? GROUP BY s.signal_id ORDER BY s.signal_id").all(taskId) as { signalId: number; title: string; summary: string; signalType: string; eventAt: string | null; sourceName: string | null; sourceTrust: number | null }[];
+  const signals = app.db.prepare("SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.event_at eventAt,d.url articleUrl,COALESCE(snapshot.status,d.status) articleStatus,src.url sourceUrl,src.name sourceName,src.trust_level sourceTrust FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id LEFT JOIN signal_sources ev ON ev.signal_id=s.signal_id AND ev.relation_type='primary' LEFT JOIN raw_discoveries d ON d.discovery_id=ev.discovery_id LEFT JOIN scan_discoveries snapshot ON snapshot.discovery_id=d.discovery_id AND snapshot.task_id=ss.task_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE ss.task_id=? GROUP BY s.signal_id ORDER BY s.signal_id").all(taskId) as { signalId: number; title: string; summary: string; signalType: string; eventAt: string | null; articleUrl: string | null; articleStatus: string | null; sourceUrl: string | null; sourceName: string | null; sourceTrust: number | null }[];
   const save = app.db.transaction((signal: typeof signals[number]) => {
     const timestamp = new Date().toISOString();
     const eventAt = signal.eventAt ?? timestamp;
     const eventType = signal.signalType;
-    for (const entity of identifyEntities(signal.title, signal.summary, signal.sourceName, signal.sourceTrust, signal.signalType)) {
+    const officialArticle = Boolean(signal.articleStatus === 'accepted' && signal.sourceUrl && signal.articleUrl && isFirstPartyArticle(signal.sourceUrl, signal.articleUrl));
+    if (signal.sourceName && signal.sourceTrust === 5 && !officialArticle) {
+      const stale = app.db.prepare("SELECT e.entity_id entityId FROM signal_entities se JOIN entities e ON e.entity_id=se.entity_id WHERE se.signal_id=? AND se.role='primary' AND e.entity_type='company' AND e.name=?").get(signal.signalId, signal.sourceName) as { entityId: number } | undefined;
+      if (stale) {
+        app.db.prepare("DELETE FROM signal_entities WHERE signal_id=? AND entity_id=? AND role='primary'").run(signal.signalId, stale.entityId);
+        if (!app.db.prepare('SELECT 1 FROM signal_entities WHERE signal_id=? AND entity_id=?').get(signal.signalId, stale.entityId)) app.db.prepare('DELETE FROM entity_events WHERE signal_id=? AND entity_id=?').run(signal.signalId, stale.entityId);
+      }
+    }
+    for (const entity of identifyEntities(signal.title, signal.summary, signal.sourceName, officialArticle ? signal.sourceTrust : null, signal.signalType)) {
       const normalized = entity.name.toLowerCase().normalize('NFKC').trim();
       app.db.prepare('INSERT INTO entities(entity_type,name,normalized_name,summary,first_seen_at,last_seen_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(entity_type,normalized_name) DO UPDATE SET first_seen_at=min(first_seen_at,excluded.first_seen_at),last_seen_at=max(last_seen_at,excluded.last_seen_at),updated_at=excluded.updated_at').run(entity.type, entity.name, normalized, '', eventAt, eventAt, timestamp, timestamp);
       const row = app.db.prepare('SELECT entity_id entityId FROM entities WHERE entity_type=? AND normalized_name=?').get(entity.type, normalized) as { entityId: number };
