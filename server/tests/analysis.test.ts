@@ -69,6 +69,23 @@ test('failed extraction cannot turn a single complete discovery into a highlight
   } finally { await app.close(); db.close(); }
 });
 
+test('a complete article on the official source domain can be highlighted as first-party evidence', async () => {
+  const db = openDatabase(':memory:');
+  const app = createApp({ db, logger: false, autoRunScans: false });
+  const time = '2026-09-23T12:00:00.000Z';
+  try {
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('official-evidence','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run(time).lastInsertRowid);
+    const sourceId = (db.prepare("SELECT source_id sourceId FROM sources WHERE name='OpenAI'").get() as { sourceId: number }).sourceId;
+    const url = 'https://openai.com/research/agent-case';
+    const id = Number(db.prepare("INSERT INTO raw_discoveries(source_id,url,normalized_url,title,snippet,published_at,published_at_verified,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,1,?,?,'accepted',?,?)").run(sourceId, url, url, 'AI agent launched and deployed in production with research funding', 'Customer deployment case study pricing', time, time, 'official-evidence', time, time).lastInsertRowid);
+    db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,'source',?)").run(taskId, id, time);
+    analyzeDiscoveries(app, taskId);
+    const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
+    assert.equal(signal.evidenceLevel, 'first_party');
+    assert.equal(signal.isHighlighted, 1);
+  } finally { await app.close(); db.close(); }
+});
+
 test('undated AI discoveries become reviewable signals without pretending the date is verified', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ai-undated-'));
   const db = openDatabase(join(directory, 'test.db'));

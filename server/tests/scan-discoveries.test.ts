@@ -158,7 +158,7 @@ test('official source collection attributes a discovery first found through sear
     assert.equal(discovery.sourceName, 'OpenAI');
     const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
     assert.equal(signal.sourceName, 'OpenAI');
-    assert.equal(signal.evidenceLevel, 'first_party');
+    assert.equal(signal.evidenceLevel, 'single_source');
     assert.equal((db.prepare('SELECT count(*) count FROM raw_discoveries').get() as { count: number }).count, 1);
   } finally { await app.close(); db.close(); }
 });

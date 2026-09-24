@@ -1,6 +1,12 @@
 const weights = { novelty: 15, truth: 20, technology: 15, adoption: 20, monetization: 15, contentValue: 15 } as const;
 
-export function scoreDiscovery(discovery: { title: string; snippet: string; trustLevel?: number | null; publishedAt?: string | null; sourceName?: string | null }) {
+export function isFirstPartyArticle(sourceUrl: string, articleUrl: string) {
+  const source = new URL(sourceUrl).hostname.replace(/^www\./, '');
+  const article = new URL(articleUrl).hostname.replace(/^www\./, '');
+  return article === source || article.endsWith(`.${source}`);
+}
+
+export function scoreDiscovery(discovery: { title: string; snippet: string; trustLevel?: number | null; publishedAt?: string | null; sourceName?: string | null; sourceUrl?: string | null; articleUrl?: string | null }) {
   const text = `${discovery.title} ${discovery.snippet}`;
   const has = (pattern: RegExp) => pattern.test(text);
   const relevant = has(/\b(?:ai|llm|gpt|agent|inference|claude|gemini|deepseek|qwen|copilot|model|models|machine learning|automation)\b|人工智能|大模型|生成式|智能体|机器学习|深度学习|模型|推理|自动化/i);
@@ -9,7 +15,7 @@ export function scoreDiscovery(discovery: { title: string; snippet: string; trus
   const deployment = has(/落地|部署|实际应用|生产环境|客户案例|应用案例|实践|deplo|production|case study|customer/i);
   const commercial = has(/付费|收入|营收|订阅|定价|商业化|融资|pricing|subscription|revenue|funding/i);
   const verified = Boolean(discovery.publishedAt);
-  const trust = discovery.trustLevel ?? 0;
+  const trust = discovery.sourceUrl && discovery.articleUrl && isFirstPartyArticle(discovery.sourceUrl, discovery.articleUrl) ? discovery.trustLevel ?? 0 : Math.min(discovery.trustLevel ?? 0, 3);
   const scores = {
     novelty: 50 + Number(release) * 15,
     truth: 40 + Number(verified) * 10 + (trust >= 5 ? 20 : trust >= 4 ? 10 : 0),

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { scoreDiscovery } from '../src/domain/scoring.js';
+import { isFirstPartyArticle, scoreDiscovery } from '../src/domain/scoring.js';
 
 test('relevance keeps unrelated records out of analyzed signals', () => {
   const result = scoreDiscovery({ title: 'Autumn music event', snippet: 'A regional concert', trustLevel: 1 });
@@ -13,7 +13,7 @@ test('relevance keeps unrelated records out of analyzed signals', () => {
 });
 
 test('official dated deployment earns explainable six-dimensional score', () => {
-  const official = scoreDiscovery({ title: 'AI agent launched in production', snippet: 'Customer case study: deployment and subscription revenue', trustLevel: 5, publishedAt: '2026-09-23T12:00:00.000Z' });
+  const official = scoreDiscovery({ title: 'AI agent launched in production', snippet: 'Customer case study: deployment and subscription revenue', trustLevel: 5, publishedAt: '2026-09-23T12:00:00.000Z', sourceUrl: 'https://www.openai.com/news', articleUrl: 'https://updates.openai.com/news/ai' });
   const media = scoreDiscovery({ title: 'AI agent launched in production', snippet: 'Customer case study: deployment and subscription revenue', trustLevel: 3, publishedAt: '2026-09-23T12:00:00.000Z' });
   assert.equal(official.type, 'use_case');
   assert.equal(official.evidenceLevel, 'first_party');
@@ -22,4 +22,13 @@ test('official dated deployment earns explainable six-dimensional score', () => 
   assert.ok(official.value > media.value);
   assert.deepEqual(official.explanation.matched, ['release', 'deployment', 'commercial', 'dated', 'official_source']);
   assert.equal(official.explanation.rulesVersion, 'v1');
+});
+
+test('official source links do not confer first-party trust on external articles', () => {
+  assert.equal(isFirstPartyArticle('https://www.openai.com/news', 'https://openai.com/research'), true);
+  assert.equal(isFirstPartyArticle('https://openai.com/news', 'https://updates.openai.com/research'), true);
+  assert.equal(isFirstPartyArticle('https://openai.com/news', 'https://openai.com.evil.example/research'), false);
+  const external = scoreDiscovery({ title: 'AI agent deployed in production', snippet: 'Customer workflow', trustLevel: 5, sourceUrl: 'https://openai.com/news', articleUrl: 'https://example.org/case' });
+  assert.equal(external.evidenceLevel, 'single_source');
+  assert.equal(external.explanation.trustLevel, 3);
 });

@@ -1,18 +1,18 @@
 import { createHash } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
-import { scoreDiscovery } from './scoring.js';
+import { isFirstPartyArticle, scoreDiscovery } from './scoring.js';
 import { contradicts, eventSimilarity, eventTokens } from './clustering.js';
 
-type Discovery = { discovery_id: number; title: string; snippet: string; url: string; normalized_url: string; content_hash: string; published_at: string | null; fetched_at: string; status: string; trustLevel: number | null; sourceName: string | null };
+type Discovery = { discovery_id: number; title: string; snippet: string; url: string; normalized_url: string; content_hash: string; published_at: string | null; fetched_at: string; status: string; trustLevel: number | null; sourceName: string | null; sourceUrl: string | null };
 type Candidate = { signalId: number; title: string; eventAt: string | null };
 
 export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
-  const discoveries = app.db.prepare("SELECT d.*,src.trust_level trustLevel,src.name sourceName FROM raw_discoveries d JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id JOIN scan_tasks t ON t.task_id=sd.task_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE sd.task_id=? AND ((d.status IN ('accepted','extract_failed') AND d.published_at BETWEEN t.range_from AND t.range_to) OR (d.status IN ('candidate','extract_failed') AND d.published_at IS NULL)) ORDER BY d.discovery_id").all(taskId) as Discovery[];
+  const discoveries = app.db.prepare("SELECT d.*,src.trust_level trustLevel,src.name sourceName,src.url sourceUrl FROM raw_discoveries d JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id JOIN scan_tasks t ON t.task_id=sd.task_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE sd.task_id=? AND ((d.status IN ('accepted','extract_failed') AND d.published_at BETWEEN t.range_from AND t.range_to) OR (d.status IN ('candidate','extract_failed') AND d.published_at IS NULL)) ORDER BY d.discovery_id").all(taskId) as Discovery[];
   const save = app.db.transaction((discovery: Discovery, rank: number) => {
     const timestamp = new Date().toISOString();
     const title = discovery.title || discovery.url;
     const summary = discovery.snippet.slice(0, 500);
-    const assessment = scoreDiscovery({ title, snippet: summary, trustLevel: discovery.trustLevel, publishedAt: discovery.published_at, sourceName: discovery.sourceName });
+    const assessment = scoreDiscovery({ title, snippet: summary, trustLevel: discovery.trustLevel, publishedAt: discovery.published_at, sourceName: discovery.sourceName, sourceUrl: discovery.sourceUrl, articleUrl: discovery.url });
     if (assessment.relevance < 35) return false;
 
     const tokens = [...eventTokens(title)].filter((token) => /[a-z0-9]/.test(token)).slice(0, 4);
@@ -43,10 +43,10 @@ export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
     const datedCount = (app.db.prepare('SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.published_at_verified=1').get(signalId) as { count: number }).count;
     const verifiedCount = (app.db.prepare("SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.published_at_verified=1 AND d.status='accepted'").get(signalId) as { count: number }).count;
     const completeCount = (app.db.prepare("SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.status='accepted'").get(signalId) as { count: number }).count;
-    const firstPartyCount = (app.db.prepare("SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id JOIN sources src ON src.source_id=d.source_id WHERE ss.signal_id=? AND d.status='accepted' AND src.trust_level=5").get(signalId) as { count: number }).count;
+    const hasFirstParty = (app.db.prepare("SELECT d.url articleUrl,src.url sourceUrl FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id JOIN sources src ON src.source_id=d.source_id WHERE ss.signal_id=? AND d.status='accepted' AND src.trust_level=5").all(signalId) as { articleUrl: string; sourceUrl: string }[]).some(({ articleUrl, sourceUrl }) => isFirstPartyArticle(sourceUrl, articleUrl));
     const prior = app.db.prepare('SELECT evidence_level evidenceLevel,has_conflict hasConflict,truth_score truthScore,value_score valueScore,state FROM signals WHERE signal_id=?').get(signalId) as { evidenceLevel: string; hasConflict: number; truthScore: number; valueScore: number; state: string };
     const hasConflict = conflict || Boolean(prior.hasConflict);
-    const evidenceLevel = hasConflict ? 'conflicting' : firstPartyCount ? 'first_party' : independentCount >= 2 ? 'multi_source' : 'single_source';
+    const evidenceLevel = hasConflict ? 'conflicting' : hasFirstParty ? 'first_party' : independentCount >= 2 ? 'multi_source' : 'single_source';
     const truthScore = hasConflict ? Math.min(prior.truthScore, 40) : Math.min(100, Math.max(prior.truthScore, discovery.status === 'extract_failed' ? 40 : assessment.scores.truth) + (independentCount >= 2 && completeCount === 2 && prior.evidenceLevel === 'single_source' ? 10 : 0));
     const valueScore = Math.max(0, Math.min(100, Math.max(prior.valueScore, assessment.value) + Math.round((truthScore - Math.max(prior.truthScore, assessment.scores.truth)) * 0.2)));
     app.db.prepare("UPDATE signals SET evidence_level=?,has_conflict=?,truth_score=?,value_score=?,state=?,score_explanation_json=json_set(score_explanation_json,'$.evidenceCount',?,'$.independentSourceCount',?,'$.hasConflict',?,'$.publishedAtVerified',?,'$.rulesVersion','v1'),updated_at=? WHERE signal_id=?").run(evidenceLevel, hasConflict ? 1 : 0, truthScore, valueScore, prior.state === 'archived' ? 'archived' : !verifiedCount || !completeCount || hasConflict || (valueScore >= 65 && evidenceLevel === 'single_source') ? 'needs_review' : 'active', evidenceCount, independentCount, hasConflict ? 1 : 0, datedCount ? 1 : 0, timestamp, signalId);
