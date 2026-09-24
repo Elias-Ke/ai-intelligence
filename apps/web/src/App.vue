@@ -19,7 +19,8 @@ const dashboardTrends = ref<Record<string, any>[]>([]); const dashboardOpportuni
 const dashboardLoading = ref(false); const dashboardError = ref(''); const groupEnabled = ref(false); const groupTotal = ref(0); const groupActive = ref(0); const groupLoading = ref(false);
 const lastRequestId = ref(''); let pendingScanKey: string | null = null;
 const newSource = reactive({ name: '', sourceGroup: '新发现候选', kind: 'web', url: '', language: 'mixed', region: 'global', trustLevel: 1, enabled: false, fetchIntervalMinutes: 1440 });
-const detailsOpen = computed({ get: () => details.value !== null, set: (open: boolean) => { if (!open) details.value = null; } });
+let detailsVersion = 0;
+const detailsOpen = computed({ get: () => details.value !== null, set: (open: boolean) => { if (!open) { detailsVersion++; details.value = null; detailsLoading.value = false; } } });
 let eventSource: EventSource | null = null; let pollTimer: ReturnType<typeof setTimeout> | null = null; let listController: AbortController | null = null; let loadVersion = 0; let dashboardVersion = 0; let groupStateVersion = 0;
 const nav = [{ key: 'dashboard', label: '今日扫描', icon: House }, { key: 'stream', label: '完整情报流', icon: DataAnalysis }, { key: 'trends', label: '趋势追踪', icon: TrendCharts }, { key: 'opportunities', label: '副业机会', icon: Compass }, { key: 'topics', label: '内容选题', icon: Document }, { key: 'saved', label: '收藏', icon: Star }, { key: 'history', label: '扫描历史', icon: List }, { key: 'sources', label: '来源库', icon: FolderOpened }] as const;
 const title = computed(() => nav.find((item) => item.key === view.value)?.label ?? '原始发现库');
@@ -117,13 +118,15 @@ async function loadHealth() {
   } catch (error) { capabilities.value = null; healthError.value = error instanceof Error ? error.message : '服务健康状态获取失败'; }
 }
 async function openDetails(type: 'signals' | 'opportunities' | 'content-topics' | 'entities' | 'scans', id: number) {
+  const version = ++detailsVersion;
   details.value = { type, id }; detailsLoading.value = true;
   try {
     const body = await (await fetch(`/api/${type}/${id}`)).json();
+    if (version !== detailsVersion) return;
     if (body.code !== 0) throw new Error(`${body.message}（${body.code}，${body.requestId}）`);
     details.value = { ...body.data, type, id };
-  } catch (error) { details.value = null; ElMessage.error(error instanceof Error ? error.message : '详情加载失败'); }
-  finally { detailsLoading.value = false; }
+  } catch (error) { if (version === detailsVersion) { details.value = null; ElMessage.error(error instanceof Error ? error.message : '详情加载失败'); } }
+  finally { if (version === detailsVersion) detailsLoading.value = false; }
 }
 type TaskSnapshot = { taskId: number; status: string; currentStep?: string; progress: number; discoveredCount: number; signalCount: number; opportunityCount: number; contentTopicCount: number; errorCode?: number | null; errorMessage?: string | null };
 const stepLabels: Record<string, string> = { collecting: '发现中', normalizing: '整理中', clustering: '去重聚类中', analyzing: '分析中', generating: '生成结果中', completed: '已完成', partial_failed: '部分完成', failed: '失败', created: '待开始' };
@@ -241,7 +244,7 @@ function showTaskResults(id: number, destination: 'stream' | 'discoveries') {
   view.value = destination; selectedTaskId.value = destination === 'stream' ? id : null; discoveryTaskId.value = destination === 'discoveries' ? id : null; void loadView();
 }
 onMounted(() => { void loadView(); void restoreTask(); void loadHealth(); });
-onBeforeUnmount(() => { clearProgressConnection(); listController?.abort(); });
+onBeforeUnmount(() => { detailsVersion++; clearProgressConnection(); listController?.abort(); });
 </script>
 
 <template>
