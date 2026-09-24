@@ -100,8 +100,11 @@ export function registerResultRoutes(app: FastifyInstance) {
     const clauses: string[] = []; const params: unknown[] = [];
     if (q.status) { clauses.push('o.status=?'); params.push(q.status); } if (q.opportunityType) { clauses.push('o.opportunity_type=?'); params.push(q.opportunityType); }
     for (const key of ['saved', 'ignored']) if (q[key] !== undefined) { clauses.push(`COALESCE(i.${key},0)=?`); params.push(bool(q[key], ErrorCodes.INVALID_OPPORTUNITY_FILTER, key)); }
-    const rows = app.db.prepare(`SELECT o.opportunity_id opportunityId,o.signal_id signalId,o.opportunity_type opportunityType,o.title,o.summary,o.evidence_score evidenceScore,o.status,COALESCE(i.saved,0) saved,COALESCE(i.ignored,0) ignored,o.created_at createdAt,o.updated_at updatedAt FROM opportunities o LEFT JOIN item_states i ON i.target_type='opportunity' AND i.target_id=o.opportunity_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${q.sort === 'newest' ? 'o.updated_at DESC' : 'o.evidence_score DESC,o.updated_at DESC'} LIMIT ?`).all(...params, limit);
-    return reply.send({ code: 0, message: 'success', data: page(rows), requestId: request.id });
+    const keys = q.sort === 'newest' ? ['o.updated_at', 'o.opportunity_id'] : ['o.evidence_score', 'o.updated_at', 'o.opportunity_id'];
+    const cursor = readCursor('opportunities', q, keys.length);
+    if (cursor) { clauses.push(`(${keys.join(',')}) < (${keys.map(() => '?').join(',')})`); params.push(...cursor); }
+    const rows = app.db.prepare(`SELECT o.opportunity_id opportunityId,o.signal_id signalId,o.opportunity_type opportunityType,o.title,o.summary,o.evidence_score evidenceScore,o.status,COALESCE(i.saved,0) saved,COALESCE(i.ignored,0) ignored,o.created_at createdAt,o.updated_at updatedAt FROM opportunities o LEFT JOIN item_states i ON i.target_type='opportunity' AND i.target_id=o.opportunity_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${keys.map((key) => `${key} DESC`).join(',')} LIMIT ?`).all(...params, limit + 1) as { opportunityId: number; evidenceScore: number; updatedAt: string }[];
+    return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('opportunities', q, q.sort === 'newest' ? [row.updatedAt, row.opportunityId] : [row.evidenceScore, row.updatedAt, row.opportunityId])), requestId: request.id });
   });
 
   app.get('/api/opportunities/:opportunityId', async (request, reply) => {
@@ -124,8 +127,11 @@ export function registerResultRoutes(app: FastifyInstance) {
     const clauses: string[] = []; const params: unknown[] = [];
     if (q.status) { clauses.push('c.status=?'); params.push(q.status); } if (q.platform) { clauses.push('c.platforms_json LIKE ?'); params.push(`%${q.platform}%`); }
     for (const key of ['saved', 'ignored']) if (q[key] !== undefined) { clauses.push(`COALESCE(i.${key},0)=?`); params.push(bool(q[key], ErrorCodes.INVALID_TOPIC_FILTER, key)); }
-    const rows = (app.db.prepare(`SELECT c.content_topic_id contentTopicId,c.signal_id signalId,c.title,c.core_viewpoint coreViewpoint,c.platforms_json platformsJson,c.evidence_score evidenceScore,c.status,COALESCE(i.saved,0) saved,COALESCE(i.ignored,0) ignored,c.created_at createdAt,c.updated_at updatedAt FROM content_topics c LEFT JOIN item_states i ON i.target_type='content_topic' AND i.target_id=c.content_topic_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${q.sort === 'newest' ? 'c.updated_at DESC' : 'c.evidence_score DESC,c.updated_at DESC'} LIMIT ?`).all(...params, limit) as Record<string, unknown>[]).map((row) => ({ ...row, platforms: parseJson(row.platformsJson, []) }));
-    return reply.send({ code: 0, message: 'success', data: page(rows), requestId: request.id });
+    const keys = q.sort === 'newest' ? ['c.updated_at', 'c.content_topic_id'] : ['c.evidence_score', 'c.updated_at', 'c.content_topic_id'];
+    const cursor = readCursor('content-topics', q, keys.length);
+    if (cursor) { clauses.push(`(${keys.join(',')}) < (${keys.map(() => '?').join(',')})`); params.push(...cursor); }
+    const rows = (app.db.prepare(`SELECT c.content_topic_id contentTopicId,c.signal_id signalId,c.title,c.core_viewpoint coreViewpoint,c.platforms_json platformsJson,c.evidence_score evidenceScore,c.status,COALESCE(i.saved,0) saved,COALESCE(i.ignored,0) ignored,c.created_at createdAt,c.updated_at updatedAt FROM content_topics c LEFT JOIN item_states i ON i.target_type='content_topic' AND i.target_id=c.content_topic_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${keys.map((key) => `${key} DESC`).join(',')} LIMIT ?`).all(...params, limit + 1) as (Record<string, unknown> & { contentTopicId: number; evidenceScore: number; updatedAt: string })[]).map((row) => ({ ...row, platforms: parseJson(row.platformsJson, []) }));
+    return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('content-topics', q, q.sort === 'newest' ? [String(row.updatedAt), Number(row.contentTopicId)] : [Number(row.evidenceScore), String(row.updatedAt), Number(row.contentTopicId)])), requestId: request.id });
   });
 
   app.get('/api/content-topics/:contentTopicId', async (request, reply) => {

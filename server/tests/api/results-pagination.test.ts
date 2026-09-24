@@ -15,6 +15,8 @@ test('discovery and signal cursors traverse unique results across scans and reje
     const tasks = [1, 2].map((id) => Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,?,?,'completed',?)").run(`pagination-${id}`, '2026-09-22T00:00:00Z', time, time).lastInsertRowid));
     const discoveryIds = [1, 2, 3].map((id) => Number(db.prepare("INSERT INTO raw_discoveries(url,normalized_url,title,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,'candidate',?,?)").run(`https://example.org/${id}`, `https://example.org/${id}`, `Discovery ${id}`, time, `hash-${id}`, time, time).lastInsertRowid));
     const signalIds = [1, 2, 3].map((id) => Number(db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,has_conflict,rules_version,state,event_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,? ,0,'v1','active',?,?,?)").run(`pagination-${id}`, `Signal ${id}`, 'summary', 'technology', 60, 60, 60 + id, 60, 60, 60, 60, id < 3 ? 70 : 60, 'single_source', time, time, time).lastInsertRowid));
+    const opportunityIds = signalIds.map((signalId, index) => Number(db.prepare("INSERT INTO opportunities(signal_id,opportunity_type,title,summary,body_json,evidence_score,status,schema_version,created_at,updated_at) VALUES(?,'product',?,'summary','{}',?,'candidate','v1',?,?)").run(signalId, `Opportunity ${index}`, index < 2 ? 70 : 60, time, time).lastInsertRowid));
+    const topicIds = signalIds.map((signalId, index) => Number(db.prepare("INSERT INTO content_topics(signal_id,title,core_viewpoint,body_json,platforms_json,evidence_score,status,schema_version,created_at,updated_at) VALUES(?,?,'view','{}','[]',?,'candidate','v1',?,?)").run(signalId, `Topic ${index}`, index < 2 ? 70 : 60, time, time).lastInsertRowid));
     for (const [index, taskId] of tasks.entries()) {
       for (const [rank, discoveryId] of discoveryIds.entries()) db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,'source',?)").run(taskId, discoveryId, time);
       for (const [rank, signalId] of signalIds.entries()) db.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,created_at) VALUES(?,?,?,?)').run(taskId, signalId, rank + 1, time);
@@ -24,7 +26,11 @@ test('discovery and signal cursors traverse unique results across scans and reje
       ['/api/discoveries', 'discoveryId', [...discoveryIds].reverse()],
       ['/api/signals', 'signalId', [signalIds[1], signalIds[0], signalIds[2]]],
       ['/api/signals?sort=newest', 'signalId', [...signalIds].reverse()],
-      ['/api/signals?sort=evidence', 'signalId', [...signalIds].reverse()]
+      ['/api/signals?sort=evidence', 'signalId', [...signalIds].reverse()],
+      ['/api/opportunities', 'opportunityId', [opportunityIds[1], opportunityIds[0], opportunityIds[2]]],
+      ['/api/opportunities?sort=newest', 'opportunityId', [...opportunityIds].reverse()],
+      ['/api/content-topics', 'contentTopicId', [topicIds[1], topicIds[0], topicIds[2]]],
+      ['/api/content-topics?sort=newest', 'contentTopicId', [...topicIds].reverse()]
     ] as const) {
       const first = (await app.inject(`${route}${route.includes('?') ? '&' : '?'}limit=1`)).json();
       assert.equal(first.code, 0, route);
@@ -42,6 +48,10 @@ test('discovery and signal cursors traverse unique results across scans and reje
       if (route !== '/api/signals?sort=newest') assert.equal(changedFilter.code, 100002);
       const fake = (await app.inject(`${route}${route.includes('?') ? '&' : '?'}cursor=c_${'a'.repeat(12)}`)).json();
       assert.equal(fake.code, 100002);
+      if (route.startsWith('/api/opportunities') || route.startsWith('/api/content-topics')) {
+        const swappedSort = route.includes('newest') ? route.split('?')[0] : `${route}?sort=newest`;
+        assert.equal((await app.inject(`${swappedSort}${swappedSort.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(first.data.nextCursor)}`)).json().code, 100002);
+      }
     }
     const scoped = (await app.inject(`/api/signals?taskId=${tasks[0]}&limit=10`)).json();
     assert.deepEqual(scoped.data.items.map((item: { signalId: number }) => item.signalId), [signalIds[1], signalIds[0], signalIds[2]]);
