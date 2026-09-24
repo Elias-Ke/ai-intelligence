@@ -7,20 +7,22 @@ import { registerSourceRoutes } from './routes/sources.js';
 import { registerScanRoutes } from './routes/scans.js';
 import { registerResultRoutes } from './routes/results.js';
 import { fetchPublic } from './ingestion/publicHttp.js';
+import { AnySearchClient } from './ingestion/AnySearchClient.js';
 
-export type AppOptions = { db: SqliteDatabase; version?: string; logger?: boolean; fetchSource?: typeof fetchPublic; autoRunScans?: boolean };
+export type AppOptions = { db: SqliteDatabase; version?: string; logger?: boolean; fetchSource?: typeof fetchPublic; autoRunScans?: boolean; searchClient?: AnySearchClient };
 
 declare module 'fastify' {
-  interface FastifyInstance { db: SqliteDatabase; appVersion: string; fetchSource: typeof fetchPublic; autoRunScans: boolean; taskEvents: EventEmitter; }
+  interface FastifyInstance { db: SqliteDatabase; appVersion: string; fetchSource: typeof fetchPublic; autoRunScans: boolean; taskEvents: EventEmitter; searchClient: AnySearchClient | null; }
 }
 
-export function createApp({ db, version = '0.1.0', logger = true, fetchSource = fetchPublic, autoRunScans = true }: AppOptions): FastifyInstance {
+export function createApp({ db, version = '0.1.0', logger = true, fetchSource = fetchPublic, autoRunScans = true, searchClient }: AppOptions): FastifyInstance {
   const app = Fastify({ logger, genReqId: () => `req_${randomUUID()}` });
   app.decorate('db', db);
   app.decorate('appVersion', version);
   app.decorate('fetchSource', fetchSource);
   app.decorate('autoRunScans', autoRunScans);
   app.decorate('taskEvents', new EventEmitter());
+  app.decorate('searchClient', searchClient ?? (process.env.ANYSEARCH_API_KEY ? new AnySearchClient(process.env.ANYSEARCH_BASE_URL ?? 'https://api.anysearch.com', process.env.ANYSEARCH_API_KEY) : null));
 
   app.addHook('onRequest', (request, _reply, done) => {
     (request as typeof request & { startedAt?: bigint }).startedAt = process.hrtime.bigint();

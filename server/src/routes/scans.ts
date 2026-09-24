@@ -4,6 +4,7 @@ import { BusinessError, ErrorCodes } from '../domain/errorCodes.js';
 import { now, parseLimit, parsePositiveId } from '../http.js';
 import { parseSource } from '../ingestion/parseSource.js';
 import { publicUrl } from '../ingestion/publicHttp.js';
+import { buildSearchQueries, QUERY_VERSION } from '../ingestion/searchQueries.js';
 
 const activeStatuses = ['created', 'collecting', 'normalizing', 'clustering', 'analyzing', 'generating', 'retrying'];
 function rangeWindow(body: Record<string, unknown>) {
@@ -25,26 +26,52 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   app.db.prepare("UPDATE scan_tasks SET status='collecting',current_step='collecting',started_at=?,heartbeat_at=? WHERE task_id=?").run(startedAt, startedAt, taskId);
   app.taskEvents.emit('changed', taskId);
   const sources = app.db.prepare('SELECT source_id sourceId,url,kind FROM sources WHERE enabled=1 ORDER BY source_id').all() as { sourceId: number; url: string; kind: 'rss' | 'api' | 'web' }[];
-  let failed = 0; let discovered = 0;
+  let failed = 0; let discovered = 0; let scanErrorCode: number | null = null;
   const saveDiscovery = app.db.transaction((sourceId: number | null, url: string, title: string, content: string, channel: 'source' | 'anysearch', publishedAt: string | null) => {
     const timestamp = now(); const normalizedUrl = new URL(url).toString(); const hash = createHash('sha256').update(content).digest('hex');
     const status = publishedAt ? new Date(publishedAt) >= rangeFrom && new Date(publishedAt) <= rangeTo ? 'accepted' : 'rejected' : 'candidate';
     app.db.prepare("INSERT OR IGNORE INTO raw_discoveries(source_id,url,normalized_url,title,snippet,content,published_at,published_at_verified,fetched_at,content_hash,status,rejection_reason,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sourceId, url, normalizedUrl, title, content.slice(0, 300), content.slice(0, 50000), publishedAt, publishedAt ? 1 : 0, timestamp, hash, status, status === 'rejected' ? 'outside_scan_range' : null, timestamp, timestamp);
     const row = app.db.prepare('SELECT discovery_id discoveryId FROM raw_discoveries WHERE normalized_url=? AND content_hash=?').get(normalizedUrl, hash) as { discoveryId: number };
+    if (publishedAt) app.db.prepare("UPDATE raw_discoveries SET published_at=?,published_at_verified=1,status=?,rejection_reason=?,last_seen_at=? WHERE discovery_id=? AND published_at_verified=0").run(publishedAt, status, status === 'rejected' ? 'outside_scan_range' : null, timestamp, row.discoveryId);
     const linked = app.db.prepare('SELECT discovery_channel FROM scan_discoveries WHERE task_id=? AND discovery_id=?').get(taskId, row.discoveryId) as { discovery_channel: string } | undefined;
     if (linked) app.db.prepare("UPDATE scan_discoveries SET discovery_channel=? WHERE task_id=? AND discovery_id=?").run(linked.discovery_channel === channel ? channel : 'both', taskId, row.discoveryId);
     else app.db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,?,?)").run(taskId, row.discoveryId, channel, timestamp);
-    return !linked;
+    return { discoveryId: row.discoveryId, isNew: !linked };
   });
   const queue = [...sources];
-  const worker = async () => { while (queue.length && discovered < 2000) { const source = queue.shift(); if (!source) return; try { const response = await app.fetchSource(source.url); const items = parseSource(response.text, response.url, source.kind, response.contentType); for (const item of items) { if (discovered >= 2000) break; if (saveDiscovery(source.sourceId, item.url, item.title, item.snippet, 'source', item.publishedAt)) discovered += 1; } app.log.info({ event: 'source.fetch.completed', taskId, sourceId: source.sourceId, resultCount: items.length }, 'source fetch completed'); } catch (error) { failed += 1; app.log.warn({ event: 'source.fetch.failed', taskId, sourceId: source.sourceId, businessCode: error instanceof BusinessError ? error.code : ErrorCodes.SOURCE_UNREACHABLE }, 'source fetch failed'); } } };
+  const worker = async () => { while (queue.length && discovered < 2000) { const source = queue.shift(); if (!source) return; try { const response = await app.fetchSource(source.url); const items = parseSource(response.text, response.url, source.kind, response.contentType); for (const item of items) { if (discovered >= 2000) break; if (saveDiscovery(source.sourceId, item.url, item.title, item.snippet, 'source', item.publishedAt).isNew) discovered += 1; } app.log.info({ event: 'source.fetch.completed', taskId, sourceId: source.sourceId, resultCount: items.length }, 'source fetch completed'); } catch (error) { failed += 1; scanErrorCode ??= error instanceof BusinessError ? error.code : ErrorCodes.SOURCE_UNREACHABLE; app.log.warn({ event: 'source.fetch.failed', taskId, sourceId: source.sourceId, businessCode: error instanceof BusinessError ? error.code : ErrorCodes.SOURCE_UNREACHABLE }, 'source fetch failed'); } } };
   await Promise.all(Array.from({ length: Math.min(8, sources.length) }, () => worker()));
-  const searchBase = process.env.ANYSEARCH_BASE_URL;
-  const searchKey = process.env.ANYSEARCH_API_KEY;
-  if (searchBase && searchKey) {
-    const queries = ['AI model release', 'AI product launch', 'AI paper agents', 'AI funding startup', 'AI enterprise use case', 'AI marketing automation', 'AI education workflow', 'AI developer tools', 'AI business service', 'AI user demand'];
-    const queue = queries.flatMap((query) => [{ query, zone: 'intl', language: 'en' }, { query: `AI ${query}`, zone: 'cn', language: 'zh-CN' }]);
-    const searchWorker = async () => { while (queue.length && discovered < 2000) { const item = queue.shift(); if (!item) return; const started = Date.now(); try { const response = await fetch(`${searchBase.replace(/\/$/, '')}/v1/search`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${searchKey}` }, body: JSON.stringify({ query: item.query, zone: item.zone, language: item.language, max_results: 10 }) }); if (!response.ok) throw new Error(`HTTP ${response.status}`); const payload = await response.json() as Record<string, unknown>; const results = (Array.isArray(payload.results) ? payload.results : Array.isArray((payload.data as Record<string, unknown> | undefined)?.results) ? (payload.data as Record<string, unknown>).results : []) as Record<string, unknown>[]; for (const result of results) { if (discovered >= 2000) break; const href = typeof result.url === 'string' ? result.url : typeof result.link === 'string' ? result.link : ''; if (!href) continue; try { const url = publicUrl(href).toString(); const date = result.publishedAt ?? result.published_at; const publishedAt = typeof date === 'string' && Number.isFinite(new Date(date).valueOf()) && new Date(date) <= new Date() ? new Date(date).toISOString() : null; if (saveDiscovery(null, url, String(result.title ?? url), String(result.content ?? result.snippet ?? ''), 'anysearch', publishedAt)) discovered += 1; } catch { continue; } } app.log.info({ event: 'anysearch.request.completed', taskId, queryKey: item.query, zone: item.zone, language: item.language, resultCount: results.length, durationMs: Date.now() - started }, 'AnySearch request completed'); } catch { failed += 1; app.log.warn({ event: 'anysearch.request.failed', taskId, zone: item.zone, language: item.language, businessCode: 300007 }, 'AnySearch request failed'); } } };
+  if (app.searchClient) {
+    const searchQueue = buildSearchQueries();
+    let quotaExhausted = false;
+    const searchWorker = async () => { while (searchQueue.length && discovered < 2000 && !quotaExhausted) {
+      const query = searchQueue.shift(); if (!query) return;
+      const started = Date.now();
+      const searchRun = app.db.prepare("INSERT INTO search_runs(task_id,query_key,query_version,query_text,zone,language,status,started_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(task_id,query_key,zone,language) DO UPDATE SET status='running',error_code=NULL,started_at=excluded.started_at RETURNING search_run_id searchRunId").get(taskId, query.queryKey, QUERY_VERSION, query.queryText, query.zone, query.language, 'running', now()) as { searchRunId: number };
+      try {
+        const { requestId, results } = await app.searchClient!.search(query);
+        for (const [index, result] of results.entries()) {
+          if (discovered >= 2000) break;
+          try {
+            const url = publicUrl(result.url).toString();
+            const date = result.publishedAt ?? result.published_at;
+            const publishedAt = date && Number.isFinite(new Date(date).valueOf()) && new Date(date) <= new Date() ? new Date(date).toISOString() : null;
+            const stored = saveDiscovery(null, url, result.title || url, result.content ?? result.snippet ?? '', 'anysearch', publishedAt);
+            if (stored.isNew) discovered += 1;
+            app.db.prepare('INSERT OR IGNORE INTO discovery_search_runs(discovery_id,search_run_id,result_rank) VALUES(?,?,?)').run(stored.discoveryId, searchRun.searchRunId, index + 1);
+          } catch (error) { if (!(error instanceof BusinessError)) throw error; }
+        }
+        app.db.prepare("UPDATE search_runs SET status='completed',anysearch_request_id=?,result_count=?,duration_ms=?,finished_at=? WHERE search_run_id=?").run(requestId, results.length, Date.now() - started, now(), searchRun.searchRunId);
+        app.log.info({ event: 'anysearch.request.completed', taskId, searchRunId: searchRun.searchRunId, queryKey: query.queryKey, zone: query.zone, language: query.language, anysearchRequestId: requestId, resultCount: results.length }, 'AnySearch request completed');
+      } catch (error) {
+        const code = error instanceof BusinessError ? error.code : ErrorCodes.SEARCH_UNAVAILABLE;
+        app.db.prepare("UPDATE search_runs SET status='failed',error_code=?,duration_ms=?,finished_at=? WHERE search_run_id=?").run(code, Date.now() - started, now(), searchRun.searchRunId);
+        if (code === ErrorCodes.SEARCH_QUOTA_EXHAUSTED) quotaExhausted = true;
+        failed += 1;
+        scanErrorCode ??= code;
+        app.log.warn({ event: 'anysearch.request.failed', taskId, searchRunId: searchRun.searchRunId, queryKey: query.queryKey, businessCode: code }, 'AnySearch request failed');
+      }
+    } };
     await Promise.all(Array.from({ length: 5 }, () => searchWorker()));
   }
   app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,heartbeat_at=? WHERE task_id=?').run('analyzing', 'analyzing', 70, discovered, now(), taskId);
@@ -59,7 +86,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     app.db.prepare("INSERT OR IGNORE INTO signal_sources(signal_id,discovery_id,relation_type,is_independent,added_at) VALUES(?,?,?,?,?)").run(signal.signalId, discovery.discovery_id, 'primary', 1, timestamp);
   }
   const finalStatus = failed && discovered ? 'partial_failed' : failed ? 'failed' : 'completed';
-  app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,signal_count=?,opportunity_count=?,content_topic_count=?,finished_at=?,heartbeat_at=? WHERE task_id=?').run(finalStatus, 'generating', 100, discovered, signals, 0, 0, now(), now(), taskId);
+  app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,signal_count=?,opportunity_count=?,content_topic_count=?,error_code=?,error_message=?,finished_at=?,heartbeat_at=? WHERE task_id=?').run(finalStatus, 'generating', 100, discovered, signals, 0, 0, scanErrorCode, scanErrorCode === null ? null : new BusinessError(scanErrorCode as never).message, now(), now(), taskId);
   app.taskEvents.emit('changed', taskId);
   app.log.info({ event: finalStatus === 'completed' ? 'scan.task.completed' : 'scan.task.partial_failed', taskId, discovered, signals, opportunities: 0, topics: 0, failed }, 'scan task finished');
 }
