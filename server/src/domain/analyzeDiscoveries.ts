@@ -35,11 +35,17 @@ export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
     const existing = app.db.prepare('SELECT d.discovery_id discoveryId,d.url,d.normalized_url normalizedUrl,d.title FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=?').all(signalId) as { discoveryId: number; url: string; normalizedUrl: string; title: string }[];
     const sameUrl = existing.some((row) => row.normalizedUrl === discovery.normalized_url);
     const conflict = existing.some((row) => contradicts(title, row.title));
-    const domain = new URL(discovery.url).hostname.replace(/^www\./, '');
-    const independent = !existing.some((row) => new URL(row.url).hostname.replace(/^www\./, '') === domain);
-    app.db.prepare('INSERT OR IGNORE INTO signal_sources(signal_id,discovery_id,relation_type,is_independent,added_at) VALUES(?,?,?,?,?)').run(signalId, discovery.discovery_id, conflict ? 'conflicting' : sameUrl ? 'duplicate' : existing.length ? 'supporting' : 'primary', independent ? 1 : 0, timestamp);
+    app.db.prepare('INSERT OR IGNORE INTO signal_sources(signal_id,discovery_id,relation_type,is_independent,added_at) VALUES(?,?,?,?,?)').run(signalId, discovery.discovery_id, conflict ? 'conflicting' : sameUrl ? 'duplicate' : existing.length ? 'supporting' : 'primary', 0, timestamp);
     const evidenceCount = (app.db.prepare('SELECT count(*) count FROM signal_sources WHERE signal_id=?').get(signalId) as { count: number }).count;
-    const independentCount = (app.db.prepare("SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND ss.is_independent=1 AND d.status='accepted'").get(signalId) as { count: number }).count;
+    const evidence = app.db.prepare('SELECT ss.discovery_id discoveryId,ss.is_independent isIndependent,d.url,d.status FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? ORDER BY ss.discovery_id').all(signalId) as { discoveryId: number; isIndependent: number; url: string; status: string }[];
+    const independentHosts = new Set<string>();
+    for (const row of evidence) {
+      const host = new URL(row.url).hostname.replace(/^www\./, '');
+      const independent = row.status === 'accepted' && !independentHosts.has(host) ? 1 : 0;
+      if (row.status === 'accepted') independentHosts.add(host);
+      if (row.isIndependent !== independent) app.db.prepare('UPDATE signal_sources SET is_independent=? WHERE signal_id=? AND discovery_id=?').run(independent, signalId, row.discoveryId);
+    }
+    const independentCount = independentHosts.size;
     const datedCount = (app.db.prepare('SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.published_at_verified=1').get(signalId) as { count: number }).count;
     const verifiedCount = (app.db.prepare("SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.published_at_verified=1 AND d.status='accepted'").get(signalId) as { count: number }).count;
     const completeCount = (app.db.prepare("SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.status='accepted'").get(signalId) as { count: number }).count;

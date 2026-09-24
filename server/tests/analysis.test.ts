@@ -69,6 +69,28 @@ test('failed extraction cannot turn a single complete discovery into a highlight
   } finally { await app.close(); db.close(); }
 });
 
+test('failed evidence does not claim a host needed by later complete independent sources', async () => {
+  const db = openDatabase(':memory:');
+  const app = createApp({ db, logger: false, autoRunScans: false });
+  const time = '2026-09-23T12:00:00.000Z';
+  try {
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('independent-after-failure','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run(time).lastInsertRowid);
+    const urls = ['https://a.example.org/failed', 'https://a.example.org/complete', 'https://b.example.org/complete'];
+    for (const [index, url] of urls.entries()) {
+      const status = index === 0 ? 'extract_failed' : 'accepted';
+      const id = Number(db.prepare('INSERT INTO raw_discoveries(url,normalized_url,title,snippet,published_at,published_at_verified,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,1,?,?,?,?,?)').run(url, url, 'AI agent launched and deployed in schools', 'Customer production workflow', time, time, `independent-${index}`, status, time, time).lastInsertRowid);
+      db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,status,discovered_at) VALUES(?,?,'anysearch',?,?)").run(taskId, id, status, time);
+    }
+    assert.equal(analyzeDiscoveries(app, taskId), 1);
+    const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
+    assert.equal(signal.evidenceLevel, 'multi_source');
+    assert.equal((await app.inject(`/api/signals/${signal.signalId}`)).json().data.scoreExplanation.independentSourceCount, 2);
+    assert.deepEqual((db.prepare('SELECT is_independent independent FROM signal_sources ORDER BY discovery_id').all() as { independent: number }[]).map(({ independent }) => independent), [0, 1, 1]);
+    assert.equal(analyzeDiscoveries(app, taskId), 1);
+    assert.deepEqual((db.prepare('SELECT is_independent independent FROM signal_sources ORDER BY discovery_id').all() as { independent: number }[]).map(({ independent }) => independent), [0, 1, 1]);
+  } finally { await app.close(); db.close(); }
+});
+
 test('a complete article on the official source domain can be highlighted as first-party evidence', async () => {
   const db = openDatabase(':memory:');
   const app = createApp({ db, logger: false, autoRunScans: false });
