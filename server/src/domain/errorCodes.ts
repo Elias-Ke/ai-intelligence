@@ -36,6 +36,9 @@ export const ErrorCodes = {
   DUPLICATE_SOURCE_URL: 800006,
   SOURCE_UNREACHABLE: 800007,
   FTS_UNAVAILABLE: 900001
+  ,LLM_TIMEOUT: 910001
+  ,LLM_INVALID_RESPONSE: 910002
+  ,CARD_MISSING_EVIDENCE: 910003
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -49,7 +52,7 @@ const messages: Record<ErrorCode, string> = {
   600001: '选题筛选或排序条件不正确', 600002: '该内容选题不存在或已失效', 600003: '内容选题状态不正确',
   700001: '趋势筛选或排序条件不正确', 700002: '该趋势对象不存在或已失效',
   800001: '来源筛选条件不正确', 800002: '该来源不存在或已失效', 800003: '至少需要保留一个可用来源或搜索配置', 800004: '来源地址必须是公开的 HTTP 或 HTTPS 地址', 800005: '来源地址指向不允许访问的网络位置', 800006: '该来源地址已经存在', 800007: '暂时无法访问该来源，请检查地址或稍后重试',
-  900001: '全文检索能力不可用，服务尚未就绪'
+  900001: '全文检索能力不可用，服务尚未就绪', 910001: '生成式模型响应超时', 910002: '生成式模型返回的数据格式不正确', 910003: '卡片缺少可回溯证据'
 };
 
 export class BusinessError extends Error {
