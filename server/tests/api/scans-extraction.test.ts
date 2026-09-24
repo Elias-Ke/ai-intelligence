@@ -34,7 +34,7 @@ test('scan extracts missing search bodies with three workers and retains metadat
     const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('extraction-test','2026-09-23T00:00:00.000Z','2026-09-24T00:00:00.000Z','created',?)").run(new Date().toISOString()).lastInsertRowid);
     await runScan(app, taskId);
     const result = db.prepare('SELECT status,discovered_count discoveredCount,signal_count signalCount,error_code errorCode FROM scan_tasks WHERE task_id=?').get(taskId) as Record<string, unknown>;
-    assert.deepEqual(result, { status: 'partial_failed', discoveredCount: 5, signalCount: 4, errorCode: 300004 });
+    assert.deepEqual(result, { status: 'partial_failed', discoveredCount: 5, signalCount: 5, errorCode: 300004 });
     assert.equal(searchCalls, 80);
     assert.equal(requests.length, 5);
     assert.equal(peak, 3);
@@ -42,6 +42,10 @@ test('scan extracts missing search bodies with three workers and retains metadat
     assert.deepEqual(discoveries.map(({ status }) => status), ['accepted', 'accepted', 'accepted', 'accepted', 'extract_failed']);
     assert.equal(discoveries[0]?.contentLength, 50_000);
     assert.equal(discoveries[4]?.snippet, 'Snippet 5');
+    const incompleteSignal = db.prepare("SELECT s.state,ss.is_highlight highlighted FROM signals s JOIN signal_sources ev ON ev.signal_id=s.signal_id JOIN scan_signals ss ON ss.signal_id=s.signal_id AND ss.task_id=? WHERE ev.discovery_id=(SELECT discovery_id FROM raw_discoveries WHERE status='extract_failed')").get(taskId) as { state: string; highlighted: number };
+    assert.deepEqual(incompleteSignal, { state: 'needs_review', highlighted: 0 });
+    assert.equal((db.prepare('SELECT count(*) count FROM opportunities').get() as { count: number }).count, 0);
+    assert.equal((db.prepare('SELECT count(*) count FROM content_topics').get() as { count: number }).count, 0);
   } finally {
     await app.close(); db.close(); rmSync(directory, { recursive: true, force: true });
   }
