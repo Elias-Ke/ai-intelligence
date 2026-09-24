@@ -5,47 +5,67 @@ import { hasLlmConfig, generateStructured } from './LlmClient.js';
 
 const evidenceIds = z.array(z.number().int().positive()).min(1);
 const text = z.string().min(1).max(2000);
+const summarySchema = z.object({ signalId: z.number().int().positive(), summary: text, evidenceIds });
 const opportunitySchema = z.object({
-  title: text, summary: text, targetUsers: text, problem: text,
+  signalId: z.number().int().positive(), title: text, summary: text, targetUsers: text, problem: text,
   alternatives: z.array(text), timingReason: text, solutionForm: text,
   deliveryDifficulty: text, acquisitionDifficulty: text, monetization: text,
-  validationAction: text, risks: z.array(text), openQuestions: z.array(text), evidenceIds
+  validationAction: text, paybackPeriod: text, risks: z.array(text), openQuestions: z.array(text), evidenceIds
 });
 const topicSchema = z.object({
-  title: text, coreViewpoint: text, coreFacts: z.array(text).min(1), background: text,
+  signalId: z.number().int().positive(), title: text, coreViewpoint: text, coreFacts: z.array(text).min(1), background: text,
   technologyChange: text, useCases: z.array(text), arguments: z.array(text),
   controversies: z.array(text), uncertainties: z.array(text),
   platformAngles: z.record(z.string(), text), evidenceIds
 });
 
-type Signal = { signalId: number; title: string; summary: string; signalType: string; valueScore: number };
+type Signal = { signalId: number; title: string; summary: string; signalType: string; valueScore: number; monetizationScore: number; adoptionScore: number; contentValueScore: number; evidenceLevel: string; hasConflict: number };
 type Evidence = { discoveryId: number; title: string; url: string; snippet: string };
 
 export async function generateCards(app: FastifyInstance, taskId: number) {
   const counts = { opportunities: 0, topics: 0, failed: 0, errorCode: null as number | null };
-  if (!hasLlmConfig()) {
-    app.log.warn({ event: 'generation.skipped', taskId, reason: 'model_not_configured' }, 'model configuration unavailable');
-    return counts;
-  }
-  const signals = app.db.prepare('SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.value_score valueScore FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id WHERE ss.task_id=? AND s.value_score>=55 ORDER BY s.value_score DESC,s.signal_id DESC').all(taskId) as Signal[];
+  const configured = hasLlmConfig();
+  const signals = app.db.prepare('SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.value_score valueScore,s.monetization_score monetizationScore,s.adoption_score adoptionScore,s.content_value_score contentValueScore,s.evidence_level evidenceLevel,s.has_conflict hasConflict FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id WHERE ss.task_id=? ORDER BY s.value_score DESC,s.signal_id DESC').all(taskId) as Signal[];
   for (const signal of signals) {
     const evidence = app.db.prepare('SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=?').all(signal.signalId) as Evidence[];
     if (!evidence.length) continue;
     const allowed = new Set(evidence.map(({ discoveryId }) => discoveryId));
     const facts = JSON.stringify({ signalId: signal.signalId, title: signal.title, summary: signal.summary, evidence: evidence.map(({ discoveryId, title, url, snippet }) => ({ discoveryId, title, url, snippet: snippet.slice(0, 300) })) });
-    for (const kind of ['opportunity', 'topic'] as const) {
+    const fallback = `原文标题：${signal.title}。已记录 ${evidence.length} 条来源，具体变化请核查原文。`;
+    let summary = fallback;
+    if (configured) {
+      try {
+        const generated = await generateStructured(`cardType:summary\n根据以下证据用中文概括事实，不得补充未经证实的数字。返回 signalId、summary、evidenceIds。\n${facts}`, summarySchema);
+        if (generated?.signalId !== signal.signalId || !generated.evidenceIds.every((id) => allowed.has(id))) throw new BusinessError(ErrorCodes.CARD_MISSING_EVIDENCE);
+        summary = generated.summary;
+      } catch (error) {
+        app.log.warn({ event: 'generation.summary.fallback', taskId, signalId: signal.signalId, businessCode: error instanceof BusinessError ? error.code : ErrorCodes.LLM_INVALID_RESPONSE }, 'rule summary preserved');
+      }
+    }
+    if (signal.summary !== summary) app.db.prepare('UPDATE signals SET summary=?,updated_at=? WHERE signal_id=?').run(summary, new Date().toISOString(), signal.signalId);
+    const kinds = signal.hasConflict ? [] : [
+      ...(signal.valueScore >= 55 && (signal.monetizationScore >= 60 || signal.adoptionScore >= 65) ? ['opportunity' as const] : []),
+      ...(signal.valueScore >= 55 && signal.contentValueScore >= 60 ? ['topic' as const] : [])
+    ];
+    if (!configured && kinds.length) {
+      counts.failed += kinds.length;
+      counts.errorCode ??= ErrorCodes.LLM_NOT_CONFIGURED;
+      app.log.warn({ event: 'generation.skipped', taskId, signalId: signal.signalId, businessCode: ErrorCodes.LLM_NOT_CONFIGURED, cardTypes: kinds }, 'model configuration unavailable');
+      continue;
+    }
+    for (const kind of kinds) {
       const schema = kind === 'opportunity' ? opportunitySchema : topicSchema;
       let saved = false;
       for (let attempt = 0; attempt < 2 && !saved; attempt++) {
         try {
           const prompt = `cardType:${kind}\n根据以下可核查事实输出中文 JSON。只引用 evidence 中真实存在的 discoveryId；没有证据支持的判断写入风险或不确定性，不能编造数据。不要写整篇文章或脚本。必须提供所有字段，evidenceIds 至少一个。\n${facts}`;
           const card = await generateStructured(prompt, schema);
-          if (!card || !card.evidenceIds.every((id: number) => allowed.has(id))) throw new BusinessError(ErrorCodes.CARD_MISSING_EVIDENCE);
+          if (!card || card.signalId !== signal.signalId || !card.evidenceIds.every((id: number) => allowed.has(id))) throw new BusinessError(ErrorCodes.CARD_MISSING_EVIDENCE);
           const timestamp = new Date().toISOString();
           const references = evidence.filter(({ discoveryId }) => card.evidenceIds.includes(discoveryId)).map(({ discoveryId, title, url }) => ({ discoveryId, title, url }));
           if (kind === 'opportunity') {
             const entry = card as z.output<typeof opportunitySchema>;
-            const opportunityType = signal.signalType === 'use_case' ? 'implementation_service' : 'product';
+            const opportunityType = signal.signalType === 'use_case' ? 'implementation_service' : signal.signalType === 'paper' ? 'knowledge_service' : signal.signalType === 'market' ? 'content_business' : signal.signalType === 'open_source' ? 'digital_product' : 'product';
             app.db.prepare("INSERT INTO opportunities(signal_id,opportunity_type,title,summary,body_json,evidence_score,status,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?,'candidate','v1',?,?) ON CONFLICT(signal_id,opportunity_type) DO UPDATE SET title=excluded.title,summary=excluded.summary,body_json=excluded.body_json,evidence_score=excluded.evidence_score,updated_at=excluded.updated_at").run(signal.signalId, opportunityType, entry.title, entry.summary, JSON.stringify({ ...entry, evidence: references }), signal.valueScore, timestamp, timestamp);
             counts.opportunities++;
           } else {

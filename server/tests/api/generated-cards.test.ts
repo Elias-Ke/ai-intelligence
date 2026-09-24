@@ -8,8 +8,8 @@ import { createApp } from '../../src/app.js';
 import { generateCards } from '../../src/generation/cards.js';
 import { openDatabase } from '../../src/persistence/database.js';
 
-const opportunity = (id: number) => ({ title: 'AI 服务实施机会', summary: '围绕有证据的实际部署提供实施服务', targetUsers: '企业团队', problem: '部署流程需要集成', alternatives: ['现有内部流程'], timingReason: '出现实际案例', solutionForm: '实施服务', deliveryDifficulty: '中', acquisitionDifficulty: '中', monetization: '按项目收费，待验证', validationAction: '访谈目标团队', risks: ['单一来源'], openQuestions: ['客户是否愿意付费'], evidenceIds: [id] });
-const topic = (id: number) => ({ title: 'AI 落地背后的技术变化', coreViewpoint: '讨论真实部署证据及限制', coreFacts: ['已有公开部署报道'], background: '行业部署背景', technologyChange: '集成流程变化', useCases: ['企业服务'], arguments: ['有实践依据'], controversies: ['缺少独立核验'], uncertainties: ['尚无客户数量数据'], platformAngles: { zhihu: '拆解实施过程', bilibili: '展示技术路径' }, evidenceIds: [id] });
+const opportunity = (id: number, signalId: number) => ({ signalId, title: 'AI 服务实施机会', summary: '围绕有证据的实际部署提供实施服务', targetUsers: '企业团队', problem: '部署流程需要集成', alternatives: ['现有内部流程'], timingReason: '出现实际案例', solutionForm: '实施服务', deliveryDifficulty: '中', acquisitionDifficulty: '中', monetization: '按项目收费，待验证', paybackPeriod: '尚待访谈确认', validationAction: '访谈目标团队', risks: ['单一来源'], openQuestions: ['客户是否愿意付费'], evidenceIds: [id] });
+const topic = (id: number, signalId: number) => ({ signalId, title: 'AI 落地背后的技术变化', coreViewpoint: '讨论真实部署证据及限制', coreFacts: ['已有公开部署报道'], background: '行业部署背景', technologyChange: '集成流程变化', useCases: ['企业服务'], arguments: ['有实践依据'], controversies: ['缺少独立核验'], uncertainties: ['尚无客户数量数据'], platformAngles: { zhihu: '拆解实施过程', bilibili: '展示技术路径' }, evidenceIds: [id] });
 
 test('cards retry invalid evidence once, persist traceable details, and update without duplication', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'ai-cards-'));
@@ -28,7 +28,7 @@ test('cards retry invalid evidence once, persist traceable details, and update w
     request.on('end', () => {
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { messages: { content: string }[] };
       const isOpportunity = body.messages[1]?.content.startsWith('cardType:opportunity');
-      const card = isOpportunity ? opportunity(forceInvalid || ++opportunityCalls === 1 ? 99999 : discoveryId) : topic(forceInvalid ? 99999 : discoveryId);
+      const card = body.messages[1]?.content.startsWith('cardType:summary') ? { signalId, summary: '公开案例显示 AI 已进入实际部署，需要进一步核验客户数据', evidenceIds: [discoveryId] } : isOpportunity ? opportunity(forceInvalid || ++opportunityCalls === 1 ? 99999 : discoveryId, signalId) : topic(forceInvalid ? 99999 : discoveryId, signalId);
       response.setHeader('content-type', 'application/json');
       response.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(card) } }] }));
     });
@@ -56,6 +56,14 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   await app.inject({ method: 'PATCH', url: `/api/opportunities/${opportunityId}/status`, payload: { status: 'verified' } });
   await generateCards(app, taskId);
   assert.equal((db.prepare('SELECT count(*) count FROM opportunities').get() as { count: number }).count, 1);
+  assert.match((db.prepare('SELECT summary FROM signals WHERE signal_id=?').get(signalId) as { summary: string }).summary, /实际部署/);
+  db.prepare('UPDATE signals SET monetization_score=50,adoption_score=50 WHERE signal_id=?').run(signalId);
+  assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 1, failed: 0, errorCode: null });
+  db.prepare('UPDATE signals SET monetization_score=60,adoption_score=60 WHERE signal_id=?').run(signalId);
+  delete process.env.LLM_MODEL;
+  assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 0, failed: 2, errorCode: 910004 });
+  assert.match((db.prepare('SELECT summary FROM signals WHERE signal_id=?').get(signalId) as { summary: string }).summary, /原文标题/);
+  process.env.LLM_MODEL = 'test-model';
   assert.equal((db.prepare('SELECT count(*) count FROM content_topics').get() as { count: number }).count, 1);
   assert.equal((db.prepare('SELECT status FROM opportunities').get() as { status: string }).status, 'verified');
   forceInvalid = true;
