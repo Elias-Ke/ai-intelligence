@@ -36,12 +36,12 @@ test('scan deadline stops new article requests and retains completed source meta
   let requests = 0;
   const app = createApp({ db, logger: false, fetchSource: async (url) => {
     requests++;
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 250));
     return { url, contentType: 'application/rss+xml', text: '<rss><channel><item><title>AI business use case launch</title><link>https://example.org/1</link><pubDate>2026-09-23T12:00:00Z</pubDate></item></channel></rss>' };
   } });
   try {
     const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('timeout','2026-09-23T00:00:00Z','2026-09-24T00:00:00Z','created',?)").run(new Date().toISOString()).lastInsertRowid);
-    await executeScan(app, taskId, new Date('2026-09-23T00:00:00Z'), new Date('2026-09-24T00:00:00Z'), 1);
+    await executeScan(app, taskId, new Date('2026-09-23T00:00:00Z'), new Date('2026-09-24T00:00:00Z'), 100);
     assert.equal(requests, 1);
     const task = db.prepare('SELECT status,error_code errorCode FROM scan_tasks WHERE task_id=?').get(taskId) as { status: string; errorCode: number };
     assert.deepEqual(task, { status: 'failed', errorCode: 200010 });

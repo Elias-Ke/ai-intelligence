@@ -11,6 +11,20 @@ import { extractArticle } from '../ingestion/extractArticle.js';
 import { generateCards } from '../generation/cards.js';
 
 const activeStatuses = ['created', 'collecting', 'normalizing', 'clustering', 'analyzing', 'generating', 'retrying'];
+const steps = ['collecting', 'normalizing', 'clustering', 'analyzing', 'generating'] as const;
+type Step = typeof steps[number];
+
+function setStep(app: FastifyInstance, taskId: number, step: Step, status: 'running' | 'completed' | 'partial_failed', count: number, errorCode: number | null = null) {
+  const timestamp = now();
+  const progress = [10, 42, 55, 70, 85][steps.indexOf(step)];
+  app.db.transaction(() => {
+    if (status === 'running') app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,heartbeat_at=?,started_at=COALESCE(started_at,?) WHERE task_id=?').run(step, step, progress, timestamp, timestamp, taskId);
+    app.db.prepare("INSERT INTO scan_task_steps(task_id,step_name,status,items_total,items_done,error_code,error_message,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id,step_name) DO UPDATE SET status=excluded.status,items_total=excluded.items_total,items_done=excluded.items_done,error_code=excluded.error_code,error_message=excluded.error_message,started_at=COALESCE(scan_task_steps.started_at,excluded.started_at),finished_at=excluded.finished_at").run(taskId, step, status, count, count, errorCode, errorCode ? new BusinessError(errorCode as never).message : null, timestamp, status === 'running' ? null : timestamp);
+  })();
+  app.taskEvents.emit('changed', taskId);
+  app.taskEvents.emit('step_progress', { taskId, stepName: step, status, itemsTotal: count, itemsDone: count, progress });
+  app.log.info({ event: `scan.step.${status === 'running' ? 'started' : 'completed'}`, taskId, stepName: step, businessCode: errorCode ?? 0, itemsDone: count }, 'scan step changed');
+}
 function rangeWindow(body: Record<string, unknown>) {
   const range = body.range;
   const to = new Date();
@@ -25,13 +39,15 @@ function rangeWindow(body: Record<string, unknown>) {
 
 function taskView(row: Record<string, unknown>) { return { taskId: row.task_id, status: row.status, currentStep: row.current_step, progress: row.progress, discoveredCount: row.discovered_count, signalCount: row.signal_count, opportunityCount: row.opportunity_count, contentTopicCount: row.content_topic_count, rangeFrom: row.range_from, rangeTo: row.range_to, errorCode: row.error_code, errorMessage: row.error_message, createdAt: row.created_at, startedAt: row.started_at, finishedAt: row.finished_at }; }
 
-export async function executeScan(app: FastifyInstance, taskId: number, rangeFrom: Date, rangeTo: Date, maxDurationMs = 30 * 60_000) {
+export async function executeScan(app: FastifyInstance, taskId: number, rangeFrom: Date, rangeTo: Date, maxDurationMs = 30 * 60_000, resumeFrom: Step = 'collecting') {
   const deadline = Date.now() + maxDurationMs;
-  const startedAt = now();
-  app.db.prepare("UPDATE scan_tasks SET status='collecting',current_step='collecting',started_at=?,heartbeat_at=? WHERE task_id=?").run(startedAt, startedAt, taskId);
-  app.taskEvents.emit('changed', taskId);
+  const fromIndex = steps.indexOf(resumeFrom);
+  if (fromIndex < 0) throw new BusinessError(ErrorCodes.INVALID_REQUEST);
   const sources = app.db.prepare('SELECT source_id sourceId,url,kind FROM sources WHERE enabled=1 ORDER BY source_id').all() as { sourceId: number; url: string; kind: 'rss' | 'api' | 'web' }[];
-  let failed = 0; let discovered = 0; let scanErrorCode: number | null = null;
+  const previous = fromIndex ? app.db.prepare(`SELECT error_code code FROM scan_task_steps WHERE task_id=? AND step_name IN (${steps.slice(0, fromIndex).map(() => '?').join(',')}) AND status IN ('partial_failed','failed')`).all(taskId, ...steps.slice(0, fromIndex)) as { code: number | null }[] : [];
+  let failed = previous.length;
+  let discovered = (app.db.prepare('SELECT count(*) count FROM scan_discoveries WHERE task_id=?').get(taskId) as { count: number }).count;
+  let scanErrorCode: number | null = previous.find(({ code }) => code !== null)?.code ?? null;
   const saveDiscovery = app.db.transaction((sourceId: number | null, url: string, title: string, content: string, channel: 'source' | 'anysearch', publishedAt: string | null, extractionFailed = false) => {
     const timestamp = now(); const normalizedUrl = new URL(url).toString(); const hash = createHash('sha256').update(content).digest('hex');
     const inRange = !publishedAt || new Date(publishedAt) >= rangeFrom && new Date(publishedAt) <= rangeTo;
@@ -44,7 +60,8 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     else app.db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,?,?)").run(taskId, row.discoveryId, channel, timestamp);
     return { discoveryId: row.discoveryId, isNew: !linked };
   });
-  const queue = [...sources];
+  if (fromIndex <= 0) setStep(app, taskId, 'collecting', 'running', discovered);
+  const queue = fromIndex <= 0 ? [...sources] : [];
   const articleQueue: { sourceId: number; url: string; title: string; snippet: string; publishedAt: string | null }[] = [];
   const timedOut = () => Date.now() >= deadline;
   const worker = async () => { while (queue.length && discovered + articleQueue.length < 2000 && !timedOut()) { const source = queue.shift(); if (!source) return; try { const response = await app.fetchSource(source.url); const items = parseSource(response.text, response.url, source.kind, response.contentType); for (const item of items) { if (discovered + articleQueue.length >= 2000) break; articleQueue.push({ ...item, sourceId: source.sourceId }); } app.db.prepare('UPDATE sources SET last_checked_at=?,last_success_at=?,last_error_code=NULL WHERE source_id=?').run(now(), now(), source.sourceId); app.log.info({ event: 'source.fetch.completed', taskId, sourceId: source.sourceId, resultCount: items.length }, 'source fetch completed'); } catch (error) { const code = error instanceof BusinessError ? error.code : ErrorCodes.SOURCE_UNREACHABLE; app.db.prepare('UPDATE sources SET last_checked_at=?,last_error_code=? WHERE source_id=?').run(now(), code, source.sourceId); failed += 1; scanErrorCode ??= code; app.log.warn({ event: 'source.fetch.failed', taskId, sourceId: source.sourceId, businessCode: code }, 'source fetch failed'); } } };
@@ -66,7 +83,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   } };
   await Promise.all(Array.from({ length: 3 }, () => articleWorker()));
   let pendingSearch = 0;
-  if (app.searchClient) {
+  if (app.searchClient && fromIndex <= 0) {
     const searchQueue = buildSearchQueries();
     const knownHosts = new Set((app.db.prepare('SELECT url FROM sources').all() as { url: string }[]).map(({ url }) => new URL(url).hostname));
     const extractionQueue: { url: string; title: string; snippet: string; publishedAt: string | null; searchRunId: number; rank: number }[] = [];
@@ -131,17 +148,25 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     pendingSearch = searchQueue.length + extractionQueue.length;
   }
   if (timedOut() && (queue.length || articleQueue.length || pendingSearch)) { failed++; scanErrorCode ??= ErrorCodes.SCAN_TIMEOUT; }
-  app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,heartbeat_at=? WHERE task_id=?').run('analyzing', 'analyzing', 70, discovered, now(), taskId);
-  app.taskEvents.emit('changed', taskId);
-  const signals = analyzeDiscoveries(app, taskId);
-  updateTrends(app, taskId);
-  app.db.prepare("UPDATE scan_tasks SET status='generating',current_step='generating',progress=85,signal_count=?,heartbeat_at=? WHERE task_id=?").run(signals, now(), taskId);
-  app.taskEvents.emit('changed', taskId);
-  const generated = await generateCards(app, taskId, deadline);
-  failed += generated.failed;
-  scanErrorCode ??= generated.errorCode;
+  if (fromIndex <= 0) {
+    app.db.prepare('UPDATE scan_tasks SET discovered_count=? WHERE task_id=?').run(discovered, taskId);
+    setStep(app, taskId, 'collecting', failed ? 'partial_failed' : 'completed', discovered, scanErrorCode);
+  }
+  if (fromIndex <= 1) { setStep(app, taskId, 'normalizing', 'running', discovered); setStep(app, taskId, 'normalizing', 'completed', discovered); }
+  let signals = (app.db.prepare('SELECT count(*) count FROM scan_signals WHERE task_id=?').get(taskId) as { count: number }).count;
+  if (fromIndex <= 2) {
+    setStep(app, taskId, 'clustering', 'running', discovered);
+    signals = analyzeDiscoveries(app, taskId);
+    setStep(app, taskId, 'clustering', 'completed', signals);
+    for (const signal of app.db.prepare('SELECT s.signal_id signalId,s.title,s.value_score valueScore FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id WHERE ss.task_id=?').all(taskId) as { signalId: number; title: string; valueScore: number }[]) app.taskEvents.emit('signal_ready', { taskId, ...signal });
+  }
+  if (fromIndex <= 3) { setStep(app, taskId, 'analyzing', 'running', signals); updateTrends(app, taskId); setStep(app, taskId, 'analyzing', 'completed', signals); }
+  let generated = { opportunities: 0, topics: 0, failed: 0, errorCode: null as number | null };
+  if (fromIndex <= 4) { setStep(app, taskId, 'generating', 'running', signals); generated = await generateCards(app, taskId, deadline); setStep(app, taskId, 'generating', generated.failed ? 'partial_failed' : 'completed', generated.opportunities + generated.topics, generated.errorCode); }
+  failed += generated.failed; scanErrorCode ??= generated.errorCode;
+  const persistedCards = app.db.prepare('SELECT (SELECT count(*) FROM opportunities o JOIN scan_signals ss ON ss.signal_id=o.signal_id WHERE ss.task_id=?) opportunities,(SELECT count(*) FROM content_topics c JOIN scan_signals ss ON ss.signal_id=c.signal_id WHERE ss.task_id=?) topics').get(taskId, taskId) as { opportunities: number; topics: number };
   const finalStatus = failed && discovered ? 'partial_failed' : failed ? 'failed' : 'completed';
-  app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,signal_count=?,opportunity_count=?,content_topic_count=?,error_code=?,error_message=?,finished_at=?,heartbeat_at=? WHERE task_id=?').run(finalStatus, 'generating', 100, discovered, signals, generated.opportunities, generated.topics, scanErrorCode, scanErrorCode === null ? null : new BusinessError(scanErrorCode as never).message, now(), now(), taskId);
+  app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,signal_count=?,opportunity_count=?,content_topic_count=?,error_code=?,error_message=?,finished_at=?,heartbeat_at=? WHERE task_id=?').run(finalStatus, 'generating', 100, discovered, signals, persistedCards.opportunities, persistedCards.topics, scanErrorCode, scanErrorCode === null ? null : new BusinessError(scanErrorCode as never).message, now(), now(), taskId);
   app.taskEvents.emit('changed', taskId);
   app.log.info({ event: finalStatus === 'completed' ? 'scan.task.completed' : 'scan.task.partial_failed', taskId, discovered, signals, opportunities: generated.opportunities, topics: generated.topics, failed }, 'scan task finished');
 }
@@ -150,10 +175,14 @@ export async function runScan(app: FastifyInstance, taskId: number) {
   try {
     const task = app.db.prepare('SELECT range_from rangeFrom,range_to rangeTo FROM scan_tasks WHERE task_id=?').get(taskId) as { rangeFrom: string; rangeTo: string } | undefined;
     if (!task) return;
-    await executeScan(app, taskId, new Date(task.rangeFrom), new Date(task.rangeTo));
+    const failedStep = app.db.prepare("SELECT step_name stepName FROM scan_task_steps WHERE task_id=? AND status IN ('partial_failed','failed') ORDER BY rowid LIMIT 1").get(taskId) as { stepName: Step } | undefined;
+    await executeScan(app, taskId, new Date(task.rangeFrom), new Date(task.rangeTo), 30 * 60_000, failedStep?.stepName ?? 'collecting');
   } catch (error) {
     const code = error instanceof BusinessError ? error.code : ErrorCodes.INTERNAL;
-    app.db.prepare("UPDATE scan_tasks SET status='failed',error_code=?,error_message=?,finished_at=?,heartbeat_at=? WHERE task_id=?").run(code, '扫描执行失败，请重试', now(), now(), taskId);
+    app.db.transaction(() => {
+      app.db.prepare("UPDATE scan_task_steps SET status='failed',error_code=?,error_message='扫描执行失败，请重试',finished_at=? WHERE task_id=? AND status='running'").run(code, now(), taskId);
+      app.db.prepare("UPDATE scan_tasks SET status='failed',error_code=?,error_message=?,started_at=COALESCE(started_at,created_at),finished_at=?,heartbeat_at=? WHERE task_id=?").run(code, '扫描执行失败，请重试', now(), now(), taskId);
+    })();
     app.taskEvents.emit('changed', taskId);
     app.log.error({ event: 'scan.task.failed', taskId, businessCode: code }, 'scan task failed');
   }
@@ -164,6 +193,7 @@ function scheduleScan(app: FastifyInstance, taskId: number) {
 }
 
 export function registerScanRoutes(app: FastifyInstance) {
+  const retryKeys = new Map<number, string>();
   app.post('/api/scans', async (request, reply) => {
     const key = request.headers['idempotency-key'];
     if (typeof key !== 'string' || key.length < 1 || key.length > 100) throw new BusinessError(ErrorCodes.MISSING_IDEMPOTENCY_KEY);
@@ -184,10 +214,13 @@ export function registerScanRoutes(app: FastifyInstance) {
     const sourceCount = (app.db.prepare('SELECT count(*) count FROM sources WHERE enabled = 1').get() as { count: number }).count;
     if (!sourceCount && !app.searchClient) throw new BusinessError(ErrorCodes.NO_AVAILABLE_SOURCE);
     const createdAt = now();
-    const result = app.db.prepare('INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,?,?,?,?)').run(key, from.toISOString(), to.toISOString(), 'created', createdAt);
-    const row = app.db.prepare('SELECT * FROM scan_tasks WHERE task_id = ?').get(result.lastInsertRowid) as Record<string, unknown>;
-    app.log.info({ event: 'scan.task.created', taskId: result.lastInsertRowid, rangeFrom: from.toISOString(), rangeTo: to.toISOString() }, 'scan task created');
-    scheduleScan(app, Number(result.lastInsertRowid));
+    const row = app.db.transaction(() => {
+      const result = app.db.prepare('INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,?,?,?,?)').run(key, from.toISOString(), to.toISOString(), 'created', createdAt);
+      for (const step of steps) app.db.prepare("INSERT INTO scan_task_steps(task_id,step_name,status) VALUES(?,?,'pending')").run(result.lastInsertRowid, step);
+      return app.db.prepare('SELECT * FROM scan_tasks WHERE task_id = ?').get(result.lastInsertRowid) as Record<string, unknown>;
+    })();
+    app.log.info({ event: 'scan.task.created', taskId: row.task_id, rangeFrom: from.toISOString(), rangeTo: to.toISOString() }, 'scan task created');
+    scheduleScan(app, Number(row.task_id));
     return reply.code(202).send({ code: 0, message: 'success', data: { ...taskView(row), reused: false }, requestId: request.id });
   });
 
@@ -208,17 +241,24 @@ export function registerScanRoutes(app: FastifyInstance) {
   });
 
   app.post('/api/scans/:taskId/retry', async (request, reply) => {
-    const key = request.headers['idempotency-key']; if (typeof key !== 'string' || !key) throw new BusinessError(ErrorCodes.MISSING_IDEMPOTENCY_KEY);
+    const key = request.headers['idempotency-key']; if (typeof key !== 'string' || !key || key.length > 100) throw new BusinessError(ErrorCodes.MISSING_IDEMPOTENCY_KEY);
+    if (!/^[\x20-\x7e]+$/.test(key)) throw new BusinessError(ErrorCodes.INVALID_REQUEST, { field: 'Idempotency-Key' });
     const id = parsePositiveId((request.params as { taskId: string }).taskId);
     const row = app.db.prepare('SELECT * FROM scan_tasks WHERE task_id = ?').get(id) as Record<string, unknown> | undefined;
     if (!row) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
+    const failedStep = app.db.prepare("SELECT step_name stepName FROM scan_task_steps WHERE task_id=? AND status IN ('partial_failed','failed') ORDER BY rowid LIMIT 1").get(id) as { stepName: Step } | undefined;
+    const resumeFromStep = failedStep?.stepName ?? 'collecting';
+    if (retryKeys.get(id) === key) return reply.send({ code: 0, message: 'success', data: { taskId: id, status: row.status, resumeFromStep, reused: true }, requestId: request.id });
+    if (row.status === 'retrying' && retryKeys.has(id)) throw new BusinessError(ErrorCodes.IDEMPOTENCY_CONFLICT);
     if (!['failed', 'partial_failed'].includes(String(row.status))) throw new BusinessError(ErrorCodes.RETRY_NOT_ALLOWED);
     const active = app.db.prepare(`SELECT task_id FROM scan_tasks WHERE status IN (${activeStatuses.map(() => '?').join(',')}) LIMIT 1`).get(...activeStatuses);
     if (active) throw new BusinessError(ErrorCodes.ACTIVE_SCAN_EXISTS);
-    app.db.prepare("UPDATE scan_tasks SET status='retrying',error_code=NULL,error_message=NULL WHERE task_id=?").run(id);
+    app.db.prepare("UPDATE scan_tasks SET status='retrying',error_code=NULL,error_message=NULL,finished_at=NULL WHERE task_id=?").run(id);
+    retryKeys.set(id, key);
     app.taskEvents.emit('changed', id);
     scheduleScan(app, id);
-    return reply.code(202).send({ code: 0, message: 'success', data: { taskId: id, status: 'retrying', resumeFromStep: row.current_step ?? 'collecting', reused: true }, requestId: request.id });
+    app.log.info({ event: 'scan.task.retried', taskId: id, resumeFromStep, businessCode: 0 }, 'scan task scheduled for retry');
+    return reply.code(202).send({ code: 0, message: 'success', data: { taskId: id, status: 'retrying', resumeFromStep, reused: true }, requestId: request.id });
   });
 
   app.get('/api/scans/:taskId/events', async (request, reply) => {
@@ -227,24 +267,34 @@ export function registerScanRoutes(app: FastifyInstance) {
     const row = app.db.prepare('SELECT * FROM scan_tasks WHERE task_id = ?').get(id) as Record<string, unknown> | undefined;
     if (!row) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
     const lastEventId = request.headers['last-event-id'];
-    if (lastEventId !== undefined && (typeof lastEventId !== 'string' || !/^\d{1,20}$/.test(lastEventId))) throw new BusinessError(ErrorCodes.INVALID_REQUEST, { field: 'Last-Event-ID' });
+    if (lastEventId !== undefined && (typeof lastEventId !== 'string' || !/^\d{1,20}$/.test(lastEventId) || !Number.isSafeInteger(Number(lastEventId)))) throw new BusinessError(ErrorCodes.INVALID_REQUEST, { field: 'Last-Event-ID' });
     reply.hijack();
     reply.raw.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     let closed = false;
-    const cleanup = () => { if (closed) return; closed = true; clearInterval(heartbeat); app.taskEvents.off('changed', sendSnapshot); };
-    const send = (event: string, data: unknown) => { if (!closed) reply.raw.write(`id: ${Date.now()}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+    const openedAt = Date.now(); let eventsSent = 0; let nextEventId = Math.max(openedAt, Number(lastEventId ?? 0) + 1);
+    const cleanup = () => { if (closed) return; closed = true; clearInterval(heartbeat); app.taskEvents.off('changed', sendSnapshot); app.taskEvents.off('step_progress', sendStep); app.taskEvents.off('signal_ready', sendSignal); app.log.info({ event: 'sse.connection.closed', requestId: request.id, taskId: id, eventsSent, durationMs: Date.now() - openedAt, businessCode: 0 }, 'SSE connection closed'); };
+    const send = (event: string, data: unknown) => { if (!closed) { reply.raw.write(`id: ${nextEventId++}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`); eventsSent++; } };
+    const sendStep = (event: { taskId: number }) => { if (event.taskId === id) send('step_progress', event); };
+    const sendSignal = (event: { taskId: number }) => { if (event.taskId === id) send('signal_ready', event); };
     const sendSnapshot = (changedId: number) => {
       if (changedId !== id || closed) return;
+      try {
       const latest = app.db.prepare('SELECT * FROM scan_tasks WHERE task_id=?').get(id) as Record<string, unknown>;
       send('task_snapshot', taskView(latest));
+      const running = app.db.prepare("SELECT step_name stepName,status,items_total itemsTotal,items_done itemsDone FROM scan_task_steps WHERE task_id=? AND status='running'").get(id) as Record<string, unknown> | undefined;
+      if (running) send('step_progress', { taskId: id, ...running, progress: latest.progress });
       if (['completed', 'partial_failed', 'failed'].includes(String(latest.status))) {
-        send(latest.status === 'completed' ? 'task_completed' : 'task_failed', taskView(latest));
+        send(latest.status === 'completed' ? 'task_completed' : 'task_failed', { ...taskView(latest), retryable: latest.status !== 'completed' });
         cleanup(); reply.raw.end();
       }
+      } catch { send('task_failed', { taskId: id, status: 'failed', errorCode: ErrorCodes.INTERNAL, errorMessage: '任务进度暂时无法读取', retryable: true }); cleanup(); reply.raw.end(); }
     };
     const heartbeat = setInterval(() => send('heartbeat', { timestamp: now() }), 15_000);
     reply.raw.on('close', cleanup);
     app.taskEvents.on('changed', sendSnapshot);
+    app.taskEvents.on('step_progress', sendStep);
+    app.taskEvents.on('signal_ready', sendSignal);
+    app.log.info({ event: 'sse.connection.opened', requestId: request.id, taskId: id, lastEventId: lastEventId ?? null, businessCode: 0 }, 'SSE connection opened');
     sendSnapshot(id);
   });
 }
