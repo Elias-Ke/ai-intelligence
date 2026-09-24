@@ -5,17 +5,19 @@ import { ErrorCodes, BusinessError } from './domain/errorCodes.js';
 import { registerSourceRoutes } from './routes/sources.js';
 import { registerScanRoutes } from './routes/scans.js';
 import { registerResultRoutes } from './routes/results.js';
+import { fetchPublic } from './ingestion/publicHttp.js';
 
-export type AppOptions = { db: SqliteDatabase; version?: string; logger?: boolean };
+export type AppOptions = { db: SqliteDatabase; version?: string; logger?: boolean; fetchSource?: typeof fetchPublic };
 
 declare module 'fastify' {
-  interface FastifyInstance { db: SqliteDatabase; appVersion: string; }
+  interface FastifyInstance { db: SqliteDatabase; appVersion: string; fetchSource: typeof fetchPublic; }
 }
 
-export function createApp({ db, version = '0.1.0', logger = true }: AppOptions): FastifyInstance {
+export function createApp({ db, version = '0.1.0', logger = true, fetchSource = fetchPublic }: AppOptions): FastifyInstance {
   const app = Fastify({ logger, genReqId: () => `req_${randomUUID()}` });
   app.decorate('db', db);
   app.decorate('appVersion', version);
+  app.decorate('fetchSource', fetchSource);
 
   app.addHook('onRequest', (request, _reply, done) => {
     (request as typeof request & { startedAt?: bigint }).startedAt = process.hrtime.bigint();

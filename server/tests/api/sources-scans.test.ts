@@ -5,11 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../../src/app.js';
 import { openDatabase } from '../../src/persistence/database.js';
+import { BusinessError, ErrorCodes } from '../../src/domain/errorCodes.js';
 
 async function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'ai-intelligence-'));
   const db = openDatabase(join(directory, 'test.db'));
-  const app = createApp({ db, logger: false });
+  const app = createApp({ db, logger: false, fetchSource: async (url) => ({ url, text: '<title>Test</title>', contentType: 'text/html' }) });
   await app.ready();
   return { app, db, directory };
 }
@@ -29,6 +30,18 @@ test('API-19/20/23 sources list, create, duplicate and toggle', async () => {
     assert.equal(toggled.statusCode, 200);
     const bad = await app.inject({ method: 'POST', url: '/api/sources', payload: { name: 'Private', sourceGroup: 'x', kind: 'web', url: 'http://127.0.0.1/x', language: 'en', region: 'intl', trustLevel: 1 } });
     assert.equal(bad.json().code, 800005);
+  } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('API-23 rejects an unreachable source without writing it', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-intelligence-'));
+  const db = openDatabase(join(directory, 'test.db'));
+  const app = createApp({ db, logger: false, fetchSource: async () => { throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE); } });
+  try {
+    const response = await app.inject({ method: 'POST', url: '/api/sources', payload: { name: 'Unreachable', sourceGroup: '测试', kind: 'web', url: 'https://example.org/absent', language: 'en', region: 'intl', trustLevel: 1 } });
+    assert.equal(response.statusCode, 502);
+    assert.equal(response.json().code, 800007);
+    assert.equal(db.prepare('SELECT 1 FROM sources WHERE url=?').get('https://example.org/absent'), undefined);
   } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

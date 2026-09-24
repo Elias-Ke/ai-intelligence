@@ -61,6 +61,7 @@ export class BusinessError extends Error {
     if (this.code === ErrorCodes.SSE_ACCEPT_REQUIRED) return 406;
     if ([ErrorCodes.SCAN_NOT_FOUND, ErrorCodes.SIGNAL_NOT_FOUND, ErrorCodes.ITEM_NOT_FOUND, ErrorCodes.OPPORTUNITY_NOT_FOUND, ErrorCodes.TOPIC_NOT_FOUND, ErrorCodes.ENTITY_NOT_FOUND, ErrorCodes.SOURCE_NOT_FOUND].includes(this.code as never)) return 404;
     if ([ErrorCodes.IDEMPOTENCY_CONFLICT, ErrorCodes.NO_AVAILABLE_SOURCE, ErrorCodes.RETRY_NOT_ALLOWED, ErrorCodes.ACTIVE_SCAN_EXISTS, ErrorCodes.LAST_SOURCE].includes(this.code as never)) return 409;
+    if (this.code === ErrorCodes.SOURCE_UNREACHABLE) return 502;
     if ([ErrorCodes.DATABASE_UNAVAILABLE, ErrorCodes.FTS_UNAVAILABLE].includes(this.code as never)) return 503;
     return 400;
   }
