@@ -69,6 +69,7 @@ export class BusinessError extends Error {
     if ([ErrorCodes.IDEMPOTENCY_CONFLICT, ErrorCodes.NO_AVAILABLE_SOURCE, ErrorCodes.RETRY_NOT_ALLOWED, ErrorCodes.ACTIVE_SCAN_EXISTS, ErrorCodes.LAST_SOURCE].includes(this.code as never)) return 409;
     if (this.code === ErrorCodes.SOURCE_UNREACHABLE) return 502;
     if ([ErrorCodes.DATABASE_UNAVAILABLE, ErrorCodes.FTS_UNAVAILABLE].includes(this.code as never)) return 503;
+    if (this.code === ErrorCodes.INTERNAL) return 500;
     return 400;
   }
 }

@@ -44,7 +44,7 @@ export function createApp({ db, version = '0.1.0', logger = true, fetchSource = 
     const business = error instanceof BusinessError ? error : new BusinessError(ErrorCodes.INTERNAL);
     const decoratedReply = reply as typeof reply & { businessCode?: number };
     decoratedReply.businessCode = business.code;
-    if (!(error instanceof BusinessError)) app.log.error({ event: 'api.request.exception', requestId: request.id, err: error }, 'unexpected request error');
+    if (!(error instanceof BusinessError)) app.log.error({ event: 'api.request.exception', requestId: request.id, businessCode: business.code, errorType: error instanceof Error ? error.name : 'unknown' }, 'unexpected request error');
     return reply.status(business.statusCode).send({ code: business.code, message: business.message, ...(business.details ? { details: business.details } : {}), requestId: request.id });
   });
 
@@ -55,7 +55,9 @@ export function createApp({ db, version = '0.1.0', logger = true, fetchSource = 
       return reply.send({ code: 0, message: 'success', data: { status: 'ok', database: 'ok', fts5: 'ok', activeTaskId: active?.task_id ?? null, version: app.appVersion }, requestId: request.id });
     } catch (error) {
       const isFts = error instanceof Error && /fts/i.test(error.message);
-      throw new BusinessError(isFts ? ErrorCodes.FTS_UNAVAILABLE : ErrorCodes.DATABASE_UNAVAILABLE);
+      const code = isFts ? ErrorCodes.FTS_UNAVAILABLE : ErrorCodes.DATABASE_UNAVAILABLE;
+      app.log.error({ event: 'health.degraded', requestId: request.id, businessCode: code, errorType: error instanceof Error ? error.name : 'unknown' }, 'health check failed');
+      throw new BusinessError(code);
     }
   });
   registerSourceRoutes(app);

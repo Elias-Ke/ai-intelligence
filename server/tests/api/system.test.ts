@@ -28,3 +28,23 @@ test('C01 migration is idempotent and FTS stays synchronized', () => {
   assert.equal((db.prepare("SELECT count(*) AS count FROM signals_fts WHERE signals_fts MATCH 'AI'").get() as { count: number }).count, 1);
   db.close(); rmSync(directory, { recursive: true, force: true });
 });
+
+test('API-21 returns numeric error codes for unavailable database and FTS5', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-intelligence-'));
+  const db = openDatabase(join(directory, 'test.db'));
+  const app = createApp({ db, logger: false });
+  t.after(async () => { await app.close(); if (db.open) db.close(); rmSync(directory, { recursive: true, force: true }); });
+  db.exec('DROP TABLE signals_fts');
+  const fts = await app.inject('/api/system/health');
+  assert.equal(fts.statusCode, 503);
+  assert.equal(fts.json().code, 900001);
+  assert.doesNotMatch(fts.body, /DROP TABLE|stack|sqlite/i);
+  db.close();
+  const unavailable = await app.inject('/api/system/health');
+  assert.equal(unavailable.statusCode, 503);
+  assert.equal(unavailable.json().code, 100004);
+  const unexpected = await app.inject('/api/sources');
+  assert.equal(unexpected.statusCode, 500);
+  assert.equal(unexpected.json().code, 100003);
+  assert.doesNotMatch(unexpected.body, /database connection|stack|SQLITE/i);
+});
