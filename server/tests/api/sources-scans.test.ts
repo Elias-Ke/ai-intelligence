@@ -56,6 +56,15 @@ test('API-01/02/03/04/05 scans validate idempotency and expose task SSE', async 
     const reused = await app.inject({ method: 'POST', url: '/api/scans', headers: { 'idempotency-key': 'scan-test-1' }, payload: { range: '24h' } });
     assert.equal(reused.statusCode, 200);
     assert.equal(reused.json().data.reused, true);
+    const conflict = await app.inject({ method: 'POST', url: '/api/scans', headers: { 'idempotency-key': 'scan-test-1' }, payload: { range: '3d' } });
+    assert.equal(conflict.statusCode, 409);
+    assert.equal(conflict.json().code, 200003);
+    assert.equal(conflict.json().message, '该请求标识已用于其他扫描参数');
+    const invalidKey = await app.inject({ method: 'POST', url: '/api/scans', headers: { 'idempotency-key': 'scan-é' }, payload: { range: '24h' } });
+    assert.equal(invalidKey.json().code, 100001);
+    const activeReuse = await app.inject({ method: 'POST', url: '/api/scans', headers: { 'idempotency-key': 'scan-test-2' }, payload: { range: '3d' } });
+    assert.equal(activeReuse.json().data.taskId, taskId);
+    assert.equal((db.prepare('SELECT count(*) count FROM scan_tasks').get() as { count: number }).count, 1);
     const details = await app.inject(`/api/scans/${taskId}`);
     assert.equal(details.statusCode, 200);
     const history = await app.inject('/api/scans?status=created');

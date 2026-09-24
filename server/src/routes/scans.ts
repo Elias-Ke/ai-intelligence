@@ -144,11 +144,18 @@ export function registerScanRoutes(app: FastifyInstance) {
   app.post('/api/scans', async (request, reply) => {
     const key = request.headers['idempotency-key'];
     if (typeof key !== 'string' || key.length < 1 || key.length > 100) throw new BusinessError(ErrorCodes.MISSING_IDEMPOTENCY_KEY);
+    if (!/^[\x20-\x7e]+$/.test(key)) throw new BusinessError(ErrorCodes.INVALID_REQUEST, { field: 'Idempotency-Key' });
     const body = (request.body ?? {}) as Record<string, unknown>;
     const { from, to } = rangeWindow(body);
     if (Number.isNaN(from.valueOf()) || Number.isNaN(to.valueOf()) || from >= to || to.getTime() - from.getTime() > 30 * 86400000) throw new BusinessError(ErrorCodes.INVALID_SCAN_RANGE);
     const existing = app.db.prepare('SELECT * FROM scan_tasks WHERE idempotency_key = ?').get(key) as Record<string, unknown> | undefined;
-    if (existing) return reply.send({ code: 0, message: 'success', data: { ...taskView(existing), reused: true }, requestId: request.id });
+    if (existing) {
+      const sameRange = body.range === 'custom'
+        ? existing.range_from === from.toISOString() && existing.range_to === to.toISOString()
+        : new Date(String(existing.range_to)).getTime() - new Date(String(existing.range_from)).getTime() === to.getTime() - from.getTime();
+      if (!sameRange) throw new BusinessError(ErrorCodes.IDEMPOTENCY_CONFLICT);
+      return reply.send({ code: 0, message: 'success', data: { ...taskView(existing), reused: true }, requestId: request.id });
+    }
     const active = app.db.prepare(`SELECT * FROM scan_tasks WHERE status IN (${activeStatuses.map(() => '?').join(',')}) LIMIT 1`).get(...activeStatuses) as Record<string, unknown> | undefined;
     if (active) return reply.send({ code: 0, message: 'success', data: { ...taskView(active), reused: true }, requestId: request.id });
     const sourceCount = (app.db.prepare('SELECT count(*) count FROM sources WHERE enabled = 1').get() as { count: number }).count;
