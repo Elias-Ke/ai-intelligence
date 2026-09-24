@@ -105,6 +105,34 @@ test('failed article extraction keeps feed metadata as a reviewable signal witho
   } finally { await app.close(); db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('successful re-extraction upgrades a reused failed discovery and its signal', async () => {
+  const db = openDatabase(':memory:');
+  db.prepare('UPDATE sources SET enabled=0 WHERE source_id!=1').run();
+  db.prepare("UPDATE sources SET kind='rss' WHERE source_id=1").run();
+  const published = new Date(Date.now() - 3_600_000).toUTCString();
+  let fail = true;
+  const app = createApp({ db, logger: false, autoRunScans: false, fetchSource: async (url) => {
+    if (url.endsWith('/ai-case')) {
+      if (fail) throw new Error('temporary article failure');
+      return { url, contentType: 'text/html', text: '<article>Customer workflow</article>' };
+    }
+    return { url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>AI Agent deployed in schools</title><link>https://example.org/ai-case</link><description>Customer workflow</description><pubDate>${published}</pubDate></item></channel></rss>` };
+  } });
+  try {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const end = new Date(); const start = new Date(end.getTime() - 86_400_000);
+      const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,?,?,'created',?)").run(`extract-attempt-${attempt}`, start.toISOString(), end.toISOString(), end.toISOString()).lastInsertRowid);
+      await executeScan(app, taskId, start, end);
+      const row = db.prepare('SELECT status,rejection_reason rejectionReason FROM raw_discoveries').get() as { status: string; rejectionReason: string | null };
+      assert.deepEqual(row, attempt === 1 ? { status: 'extract_failed', rejectionReason: 'extraction_failed' } : { status: 'accepted', rejectionReason: null });
+      assert.equal((db.prepare('SELECT state FROM signals').get() as { state: string }).state, attempt === 1 ? 'needs_review' : 'active');
+      fail = false;
+    }
+    assert.equal((db.prepare('SELECT count(*) count FROM raw_discoveries').get() as { count: number }).count, 1);
+    assert.equal((db.prepare('SELECT count(*) count FROM signals').get() as { count: number }).count, 1);
+  } finally { await app.close(); db.close(); }
+});
+
 test('scan persists 80 AnySearch runs and connects repeated results to their requests', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ai-intelligence-scan-'));
   const db = openDatabase(join(dir, 'test.db'));
