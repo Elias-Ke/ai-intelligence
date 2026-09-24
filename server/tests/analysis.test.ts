@@ -65,3 +65,23 @@ test('undated AI discoveries become reviewable signals without pretending the da
     assert.equal((db.prepare('SELECT status FROM raw_discoveries WHERE discovery_id=?').get(discoveryId) as { status: string }).status, 'candidate');
   } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('a later scan updates evidence without restoring a manually archived signal', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-archive-'));
+  const db = openDatabase(join(directory, 'test.db'));
+  const app = createApp({ db, logger: false, autoRunScans: false });
+  const time = '2026-09-23T12:00:00.000Z';
+  try {
+    const firstTask = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('archive-first','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run(time).lastInsertRowid);
+    const discoveryId = Number(db.prepare("INSERT INTO raw_discoveries(url,normalized_url,title,snippet,published_at,published_at_verified,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES('https://example.org/archive','https://example.org/archive','AI agent launched for schools','Customer deployment',?,1,?,'archive-hash','accepted',?,?)").run(time, time, time, time).lastInsertRowid);
+    db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,'anysearch',?)").run(firstTask, discoveryId, time);
+    assert.equal(analyzeDiscoveries(app, firstTask), 1);
+    const signalId = (db.prepare('SELECT signal_id signalId FROM signals').get() as { signalId: number }).signalId;
+    assert.equal((await app.inject({ method: 'PATCH', url: `/api/signals/${signalId}/state`, payload: { state: 'archived' } })).json().code, 0);
+    const nextTask = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('archive-next','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run(time).lastInsertRowid);
+    db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,'anysearch',?)").run(nextTask, discoveryId, time);
+    assert.equal(analyzeDiscoveries(app, nextTask), 1);
+    assert.equal((await app.inject(`/api/signals/${signalId}`)).json().data.state, 'archived');
+    assert.equal((db.prepare('SELECT is_highlight highlighted FROM scan_signals WHERE task_id=?').get(nextTask) as { highlighted: number }).highlighted, 0);
+  } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
