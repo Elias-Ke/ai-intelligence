@@ -18,6 +18,7 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   const discoveryId = Number(db.prepare("INSERT INTO raw_discoveries(url,normalized_url,title,snippet,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES('https://example.org/case','https://example.org/case','AI deployment','Public example',?,'case-hash','accepted',?,?)").run(time, time, time).lastInsertRowid);
   const signalId = Number(db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,has_conflict,rules_version,state,event_at,created_at,updated_at) VALUES('card-cluster','AI 部署案例','公开报道','use_case',65,65,70,50,70,60,65,64,'first_party',0,'v1','active',?,?,?)").run(time, time, time).lastInsertRowid);
   db.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,created_at) VALUES(?,?,1,?)').run(taskId, signalId, time);
+  db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,status,discovered_at) VALUES(?,?,'source','accepted',?)").run(taskId, discoveryId, time);
   db.prepare("INSERT INTO signal_sources(signal_id,discovery_id,relation_type,added_at) VALUES(?,?,'primary',?)").run(signalId, discoveryId, time);
   let opportunityCalls = 0;
   let forceInvalid = false;

@@ -62,6 +62,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     const stored = app.db.prepare('SELECT published_at publishedAt FROM raw_discoveries WHERE discovery_id=?').get(row.discoveryId) as { publishedAt: string | null };
     const dated = stored.publishedAt;
     const scanStatus = dated && (new Date(dated) < rangeFrom || new Date(dated) > rangeTo) ? 'rejected' : extractionFailed ? 'extract_failed' : dated ? 'accepted' : 'candidate';
+    if (scanStatus === 'accepted') app.db.prepare("UPDATE raw_discoveries SET status='accepted',rejection_reason=NULL,last_seen_at=? WHERE discovery_id=? AND status='rejected'").run(timestamp, row.discoveryId);
     const reason = scanStatus === 'rejected' ? 'outside_scan_range' : scanStatus === 'extract_failed' ? 'extraction_failed' : null;
     const linked = app.db.prepare('SELECT discovery_channel,status FROM scan_discoveries WHERE task_id=? AND discovery_id=?').get(taskId, row.discoveryId) as { discovery_channel: string; status: string | null } | undefined;
     if (linked) app.db.prepare('UPDATE scan_discoveries SET discovery_channel=?,status=?,rejection_reason=? WHERE task_id=? AND discovery_id=?').run(linked.discovery_channel === channel ? channel : 'both', linked.status === 'accepted' ? 'accepted' : scanStatus, linked.status === 'accepted' ? null : reason, taskId, row.discoveryId);

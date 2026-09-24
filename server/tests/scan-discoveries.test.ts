@@ -57,9 +57,10 @@ test('a wider scan reuses an earlier out-of-range discovery without changing old
   db.prepare('UPDATE sources SET enabled=0 WHERE source_id!=1').run();
   db.prepare("UPDATE sources SET kind='rss' WHERE source_id=1").run();
   const published = new Date(Date.now() - 3 * 86_400_000).toUTCString();
+  let includeDate = true;
   const app = createApp({ db, logger: false, autoRunScans: false, fetchSource: async (url) => url.endsWith('/ai-case')
     ? { url, contentType: 'text/html', text: '<article>AI Agent deployed in schools</article>' }
-    : { url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>AI Agent deployed in schools</title><link>https://example.org/ai-case</link><description>Customer workflow</description><pubDate>${published}</pubDate></item></channel></rss>` } });
+    : { url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>AI Agent deployed in schools</title><link>https://example.org/ai-case</link><description>Customer workflow</description>${includeDate ? `<pubDate>${published}</pubDate>` : ''}</item></channel></rss>` } });
   try {
     const end = new Date();
     const scan = async (key: string, days: number) => {
@@ -72,6 +73,7 @@ test('a wider scan reuses an earlier out-of-range discovery without changing old
     assert.equal((await app.inject(`/api/discoveries?taskId=${narrow}&status=rejected`)).json().data.items.length, 1);
     assert.equal((await app.inject(`/api/discoveries?taskId=${narrow}`)).json().data.items[0].rejectionReason, 'outside_scan_range');
     assert.equal((db.prepare('SELECT count(*) count FROM signals').get() as { count: number }).count, 0);
+    includeDate = false;
     const wider = await scan('range-7d', 7);
     assert.equal((db.prepare('SELECT count(*) count FROM raw_discoveries').get() as { count: number }).count, 1);
     assert.equal((await app.inject(`/api/discoveries?taskId=${wider}&status=accepted`)).json().data.items.length, 1);
@@ -79,6 +81,35 @@ test('a wider scan reuses an earlier out-of-range discovery without changing old
     assert.equal((await app.inject(`/api/signals?taskId=${wider}`)).json().data.items.length, 1);
     assert.equal((await app.inject(`/api/signals?taskId=${narrow}`)).json().data.items.length, 0);
   } finally { await app.close(); db.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a later failed extraction cannot feature or generate cards from an earlier accepted copy', async () => {
+  const db = openDatabase(':memory:');
+  db.prepare('UPDATE sources SET enabled=0 WHERE source_id!=1').run();
+  db.prepare("UPDATE sources SET kind='rss' WHERE source_id=1").run();
+  const published = new Date(Date.now() - 3_600_000).toUTCString();
+  const articleUrl = 'https://openai.com/research/case';
+  let fail = false;
+  const app = createApp({ db, logger: false, autoRunScans: false, fetchSource: async (url) => {
+    if (url === articleUrl) {
+      if (fail) throw new Error('article temporarily unavailable');
+      return { url, contentType: 'text/html', text: '<article>Customer workflow pricing</article>' };
+    }
+    return { url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>AI agent launched and deployed in production with research funding</title><link>${articleUrl}</link><description>Customer workflow pricing</description><pubDate>${published}</pubDate></item></channel></rss>` };
+  } });
+  try {
+    for (const attempt of [1, 2]) {
+      const end = new Date(); const start = new Date(end.getTime() - 86_400_000);
+      const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,?,?,'created',?)").run(`reused-evidence-${attempt}`, start.toISOString(), end.toISOString(), end.toISOString()).lastInsertRowid);
+      await executeScan(app, taskId, start, end);
+      const discovery = (await app.inject(`/api/discoveries?taskId=${taskId}`)).json().data.items[0];
+      const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
+      assert.equal(discovery.status, attempt === 1 ? 'accepted' : 'extract_failed');
+      assert.equal(signal.isHighlighted, attempt === 1 ? 1 : 0);
+      if (attempt === 2) assert.equal((db.prepare("SELECT status FROM scan_task_steps WHERE task_id=? AND step_name='generating'").get(taskId) as { status: string }).status, 'completed');
+      fail = true;
+    }
+  } finally { await app.close(); db.close(); }
 });
 
 test('failed article extraction keeps feed metadata as a reviewable signal without generating cards', async () => {
