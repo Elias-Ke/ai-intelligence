@@ -7,6 +7,7 @@ import { createApp } from '../src/app.js';
 import { openDatabase } from '../src/persistence/database.js';
 import { executeScan } from '../src/routes/scans.js';
 import { AnySearchClient } from '../src/ingestion/AnySearchClient.js';
+import { createHash } from 'node:crypto';
 
 test('scan keeps undated articles as reviewable signals without inventing cards', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ai-intelligence-scan-'));
@@ -130,6 +131,30 @@ test('successful re-extraction upgrades a reused failed discovery and its signal
     }
     assert.equal((db.prepare('SELECT count(*) count FROM raw_discoveries').get() as { count: number }).count, 1);
     assert.equal((db.prepare('SELECT count(*) count FROM signals').get() as { count: number }).count, 1);
+  } finally { await app.close(); db.close(); }
+});
+
+test('official source collection attributes a discovery first found through search', async () => {
+  const db = openDatabase(':memory:');
+  db.prepare('UPDATE sources SET enabled=0 WHERE source_id!=1').run();
+  db.prepare("UPDATE sources SET kind='rss' WHERE source_id=1").run();
+  const published = new Date(Date.now() - 3_600_000);
+  const content = 'Customer workflow';
+  const hash = createHash('sha256').update(content).digest('hex');
+  db.prepare("INSERT INTO raw_discoveries(url,normalized_url,title,snippet,content,published_at,published_at_verified,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES('https://example.org/ai-case','https://example.org/ai-case','AI Agent deployed in schools',?,?,?,1,?,?,'accepted',?,?)").run(content, content, published.toISOString(), published.toISOString(), hash, published.toISOString(), published.toISOString());
+  const app = createApp({ db, logger: false, autoRunScans: false, fetchSource: async (url) => url.endsWith('/ai-case')
+    ? { url, contentType: 'text/html', text: '<article>Customer workflow</article>' }
+    : { url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>AI Agent deployed in schools</title><link>https://example.org/ai-case</link><description>Customer workflow</description><pubDate>${published.toUTCString()}</pubDate></item></channel></rss>` } });
+  try {
+    const end = new Date(); const start = new Date(end.getTime() - 86_400_000);
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('source-attribution',?,?,'created',?)").run(start.toISOString(), end.toISOString(), end.toISOString()).lastInsertRowid);
+    await executeScan(app, taskId, start, end);
+    const discovery = (await app.inject(`/api/discoveries?taskId=${taskId}`)).json().data.items[0];
+    assert.equal(discovery.sourceName, 'OpenAI');
+    const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
+    assert.equal(signal.sourceName, 'OpenAI');
+    assert.equal(signal.evidenceLevel, 'first_party');
+    assert.equal((db.prepare('SELECT count(*) count FROM raw_discoveries').get() as { count: number }).count, 1);
   } finally { await app.close(); db.close(); }
 });
 
