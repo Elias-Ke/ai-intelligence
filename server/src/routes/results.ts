@@ -21,16 +21,19 @@ export function registerResultRoutes(app: FastifyInstance) {
     const q = request.query as Record<string, unknown>; const limit = parseLimit(q.limit);
     const statuses = ['candidate', 'accepted', 'rejected', 'extract_failed']; const channels = ['source', 'anysearch', 'both'];
     if ((q.status && !statuses.includes(String(q.status))) || (q.channel && !channels.includes(String(q.channel))) || (q.q && String(q.q).length > 200)) throw new BusinessError(ErrorCodes.INVALID_DISCOVERY_FILTER);
-    if (q.taskId && !app.db.prepare('SELECT 1 FROM scan_tasks WHERE task_id=?').get(Number(q.taskId))) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
+    const taskId = q.taskId === undefined ? null : parsePositiveId(String(q.taskId));
+    if (taskId && !app.db.prepare('SELECT 1 FROM scan_tasks WHERE task_id=?').get(taskId)) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
+    const status = taskId ? "CASE WHEN d.published_at IS NOT NULL AND d.published_at NOT BETWEEN t.range_from AND t.range_to THEN 'rejected' ELSE d.status END" : 'd.status';
+    const rejectionReason = taskId ? "CASE WHEN d.published_at IS NOT NULL AND d.published_at NOT BETWEEN t.range_from AND t.range_to THEN 'outside_scan_range' ELSE d.rejection_reason END" : 'd.rejection_reason';
     const clauses: string[] = []; const params: unknown[] = [];
-    if (q.taskId) { clauses.push('EXISTS (SELECT 1 FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id AND sd.task_id=?)'); params.push(Number(q.taskId)); }
-    if (q.status) { clauses.push('d.status=?'); params.push(q.status); }
-    if (q.channel) { clauses.push(`EXISTS (SELECT 1 FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id AND sd.discovery_channel=? ${q.taskId ? 'AND sd.task_id=?' : ''})`); params.push(q.channel); if (q.taskId) params.push(Number(q.taskId)); }
+    if (taskId) { clauses.push('EXISTS (SELECT 1 FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id AND sd.task_id=?)'); params.push(taskId); }
+    if (q.status) { clauses.push(`${status}=?`); params.push(q.status); }
+    if (q.channel) { clauses.push(`EXISTS (SELECT 1 FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id AND sd.discovery_channel=? ${taskId ? 'AND sd.task_id=?' : ''})`); params.push(q.channel); if (taskId) params.push(taskId); }
     if (q.publishedAtVerified !== undefined) { clauses.push('d.published_at_verified=?'); params.push(bool(q.publishedAtVerified, ErrorCodes.INVALID_DISCOVERY_FILTER, 'publishedAtVerified')); }
     if (q.q) { clauses.push('(d.title LIKE ? OR d.url LIKE ?)'); params.push(`%${q.q}%`, `%${q.q}%`); }
     const cursor = readCursor('discoveries', q, 2);
     if (cursor) { clauses.push('(d.last_seen_at,d.discovery_id) < (?,?)'); params.push(...cursor); }
-    const rows = app.db.prepare(`SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,s.name sourceName,(SELECT sd.discovery_channel FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id ${q.taskId ? 'AND sd.task_id=?' : ''} ORDER BY sd.task_id DESC LIMIT 1) channel,d.published_at publishedAt,d.published_at_verified publishedAtVerified,d.status,d.rejection_reason rejectionReason,d.first_seen_at firstSeenAt,d.last_seen_at lastSeenAt FROM raw_discoveries d LEFT JOIN sources s ON s.source_id=d.source_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY d.last_seen_at DESC,d.discovery_id DESC LIMIT ?`).all(...(q.taskId ? [Number(q.taskId)] : []), ...params, limit + 1) as { discoveryId: number; lastSeenAt: string }[];
+    const rows = app.db.prepare(`SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,s.name sourceName,(SELECT sd.discovery_channel FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id ${taskId ? 'AND sd.task_id=?' : ''} ORDER BY sd.task_id DESC LIMIT 1) channel,d.published_at publishedAt,d.published_at_verified publishedAtVerified,${status} status,${rejectionReason} rejectionReason,d.first_seen_at firstSeenAt,d.last_seen_at lastSeenAt FROM raw_discoveries d LEFT JOIN sources s ON s.source_id=d.source_id ${taskId ? 'JOIN scan_tasks t ON t.task_id=?' : ''} ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY d.last_seen_at DESC,d.discovery_id DESC LIMIT ?`).all(...(taskId ? [taskId, taskId] : []), ...params, limit + 1) as { discoveryId: number; lastSeenAt: string }[];
     return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('discoveries', q, [row.lastSeenAt, row.discoveryId])), requestId: request.id });
   });
 

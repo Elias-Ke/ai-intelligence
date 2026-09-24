@@ -7,7 +7,7 @@ type Discovery = { discovery_id: number; title: string; snippet: string; url: st
 type Candidate = { signalId: number; title: string; eventAt: string | null };
 
 export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
-  const discoveries = app.db.prepare("SELECT d.*,src.trust_level trustLevel,src.name sourceName FROM raw_discoveries d JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE sd.task_id=? AND (d.status='accepted' OR (d.status='candidate' AND d.published_at IS NULL)) ORDER BY d.discovery_id").all(taskId) as Discovery[];
+  const discoveries = app.db.prepare("SELECT d.*,src.trust_level trustLevel,src.name sourceName FROM raw_discoveries d JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id JOIN scan_tasks t ON t.task_id=sd.task_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE sd.task_id=? AND ((d.status='accepted' AND d.published_at BETWEEN t.range_from AND t.range_to) OR (d.status='candidate' AND d.published_at IS NULL)) ORDER BY d.discovery_id").all(taskId) as Discovery[];
   const save = app.db.transaction((discovery: Discovery, rank: number) => {
     const timestamp = new Date().toISOString();
     const title = discovery.title || discovery.url;
