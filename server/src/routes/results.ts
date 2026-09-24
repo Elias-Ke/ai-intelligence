@@ -8,7 +8,6 @@ const bool = (value: unknown, code: number, field: string) => {
   if (value !== 'true' && value !== 'false') throw new BusinessError(code as never, { field });
   return value === 'true' ? 1 : 0;
 };
-const page = (items: unknown[]) => ({ items, nextCursor: null });
 const parseJson = (value: unknown, fallback: unknown) => { try { return JSON.parse(String(value ?? '')); } catch { return fallback; } };
 
 function targetExists(app: FastifyInstance, type: string, id: number) {
@@ -50,9 +49,17 @@ export function registerResultRoutes(app: FastifyInstance) {
     if (q.saved !== undefined) { clauses.push('COALESCE(i.saved,0)=?'); params.push(bool(q.saved, ErrorCodes.INVALID_SIGNAL_FILTER, 'saved')); }
     if (q.ignored !== undefined) { clauses.push('COALESCE(i.ignored,0)=?'); params.push(bool(q.ignored, ErrorCodes.INVALID_SIGNAL_FILTER, 'ignored')); }
     if (q.highlighted !== undefined) { if (!q.taskId) throw new BusinessError(ErrorCodes.INVALID_SIGNAL_FILTER); clauses.push('EXISTS(SELECT 1 FROM scan_signals ss WHERE ss.signal_id=s.signal_id AND ss.task_id=? AND ss.is_highlight=?)'); params.push(Number(q.taskId), bool(q.highlighted, ErrorCodes.INVALID_SIGNAL_FILTER, 'highlighted')); }
-    if (q.q) { clauses.push('(s.title LIKE ? OR s.summary LIKE ? OR s.search_text LIKE ?)'); params.push(`%${q.q}%`, `%${q.q}%`, `%${q.q}%`); }
+    if (q.q) {
+      const term = String(q.q).trim();
+      if (!term || !/^[\p{L}\p{N}\s-]+$/u.test(term)) throw new BusinessError(ErrorCodes.INVALID_FTS_QUERY);
+      const match = term.split(/\s+/).map((part) => `"${part.replaceAll('"', '')}"*`).join(' AND ');
+      if (/\p{Script=Han}/u.test(term)) {
+        clauses.push('(s.signal_id IN (SELECT rowid FROM signals_fts WHERE signals_fts MATCH ?) OR s.title LIKE ? OR s.summary LIKE ? OR s.search_text LIKE ?)');
+        params.push(match, `%${term}%`, `%${term}%`, `%${term}%`);
+      } else { clauses.push('s.signal_id IN (SELECT rowid FROM signals_fts WHERE signals_fts MATCH ?)'); params.push(match); }
+    }
     const sort = q.sort === 'newest' ? 'newest' : q.sort === 'evidence' ? 'evidence' : 'value';
-    const priority = 's.value_score + CASE WHEN EXISTS(SELECT 1 FROM signal_entities se JOIN entities e ON e.entity_id=se.entity_id WHERE se.signal_id=s.signal_id AND e.followed=1) THEN 10 ELSE 0 END';
+    const priority = 's.value_score + COALESCE(i.value_rating,0)*10 + CASE WHEN EXISTS(SELECT 1 FROM signal_entities se JOIN entities e ON e.entity_id=se.entity_id WHERE se.signal_id=s.signal_id AND e.followed=1) THEN 10 ELSE 0 END';
     const keys = sort === 'newest' ? ["COALESCE(s.event_at,'')", 's.signal_id'] : sort === 'evidence' ? ['s.truth_score', 's.value_score', 's.signal_id'] : [priority, "COALESCE(s.event_at,'')", 's.signal_id'];
     const cursor = readCursor('signals', q, keys.length);
     if (cursor) { clauses.push(`(${keys.join(',')}) < (${keys.map(() => '?').join(',')})`); params.push(...cursor); }
@@ -87,7 +94,7 @@ export function registerResultRoutes(app: FastifyInstance) {
     if (!targetExists(app, targetType, id)) throw new BusinessError(ErrorCodes.ITEM_NOT_FOUND);
     const body = (request.body ?? {}) as Record<string, unknown>;
     if (!['saved', 'ignored', 'valueRating'].some((key) => key in body)) throw new BusinessError(ErrorCodes.EMPTY_ITEM_STATE);
-    if ((body.saved !== undefined && typeof body.saved !== 'boolean') || (body.ignored !== undefined && typeof body.ignored !== 'boolean') || (body.valueRating !== undefined && ![-1, 0, 1].includes(Number(body.valueRating)))) throw new BusinessError(ErrorCodes.INVALID_REQUEST);
+    if ((body.saved !== undefined && typeof body.saved !== 'boolean') || (body.ignored !== undefined && typeof body.ignored !== 'boolean') || (body.valueRating !== undefined && (typeof body.valueRating !== 'number' || ![-1, 0, 1].includes(body.valueRating)))) throw new BusinessError(ErrorCodes.INVALID_REQUEST);
     const current = app.db.prepare('SELECT saved,ignored,value_rating valueRating FROM item_states WHERE target_type=? AND target_id=?').get(targetType, id) as { saved: number; ignored: number; valueRating: number } | undefined;
     const saved = body.saved === undefined ? current?.saved ?? 0 : Number(body.saved); const ignored = body.ignored === undefined ? current?.ignored ?? 0 : Number(body.ignored); const valueRating = body.valueRating === undefined ? current?.valueRating ?? 0 : Number(body.valueRating);
     if (saved && ignored) throw new BusinessError(ErrorCodes.CONTRADICTORY_ITEM_STATE);
@@ -97,7 +104,7 @@ export function registerResultRoutes(app: FastifyInstance) {
 
   app.get('/api/opportunities', async (request, reply) => {
     const q = request.query as Record<string, unknown>; const limit = parseLimit(q.limit);
-    if ((q.status && !['candidate', 'prepare_verification', 'verified'].includes(String(q.status))) || (q.sort && !['evidence', 'newest'].includes(String(q.sort)))) throw new BusinessError(ErrorCodes.INVALID_OPPORTUNITY_FILTER);
+    if ((q.status && !['candidate', 'prepare_verification', 'verified'].includes(String(q.status))) || (q.sort && !['evidence', 'newest'].includes(String(q.sort))) || (q.opportunityType && !['product', 'implementation_service', 'knowledge_service', 'content_business', 'digital_product'].includes(String(q.opportunityType)))) throw new BusinessError(ErrorCodes.INVALID_OPPORTUNITY_FILTER);
     const clauses: string[] = []; const params: unknown[] = [];
     if (q.status) { clauses.push('o.status=?'); params.push(q.status); } if (q.opportunityType) { clauses.push('o.opportunity_type=?'); params.push(q.opportunityType); }
     for (const key of ['saved', 'ignored']) if (q[key] !== undefined) { clauses.push(`COALESCE(i.${key},0)=?`); params.push(bool(q[key], ErrorCodes.INVALID_OPPORTUNITY_FILTER, key)); }
@@ -124,9 +131,9 @@ export function registerResultRoutes(app: FastifyInstance) {
 
   app.get('/api/content-topics', async (request, reply) => {
     const q = request.query as Record<string, unknown>; const limit = parseLimit(q.limit);
-    if ((q.status && !['candidate', 'preparing', 'published'].includes(String(q.status))) || (q.sort && !['evidence', 'newest'].includes(String(q.sort)))) throw new BusinessError(ErrorCodes.INVALID_TOPIC_FILTER);
+    if ((q.status && !['candidate', 'preparing', 'published'].includes(String(q.status))) || (q.sort && !['evidence', 'newest'].includes(String(q.sort))) || (q.platform && !['wechat', 'video_account', 'xiaohongshu', 'zhihu', 'bilibili', 'douyin', 'x', 'newsletter'].includes(String(q.platform)))) throw new BusinessError(ErrorCodes.INVALID_TOPIC_FILTER);
     const clauses: string[] = []; const params: unknown[] = [];
-    if (q.status) { clauses.push('c.status=?'); params.push(q.status); } if (q.platform) { clauses.push('c.platforms_json LIKE ?'); params.push(`%${q.platform}%`); }
+    if (q.status) { clauses.push('c.status=?'); params.push(q.status); } if (q.platform) { clauses.push('EXISTS(SELECT 1 FROM json_each(c.platforms_json) WHERE json_each.value=?)'); params.push(q.platform); }
     for (const key of ['saved', 'ignored']) if (q[key] !== undefined) { clauses.push(`COALESCE(i.${key},0)=?`); params.push(bool(q[key], ErrorCodes.INVALID_TOPIC_FILTER, key)); }
     const keys = q.sort === 'newest' ? ['c.updated_at', 'c.content_topic_id'] : ['c.evidence_score', 'c.updated_at', 'c.content_topic_id'];
     const cursor = readCursor('content-topics', q, keys.length);
@@ -154,15 +161,21 @@ export function registerResultRoutes(app: FastifyInstance) {
     if ((q.entityType && !types.includes(String(q.entityType))) || (q.sort && !['latest', 'signals'].includes(String(q.sort))) || (q.q && String(q.q).length > 100)) throw new BusinessError(ErrorCodes.INVALID_ENTITY_FILTER);
     const clauses: string[] = []; const params: unknown[] = [];
     if (q.entityType) { clauses.push('e.entity_type=?'); params.push(q.entityType); } if (q.followed !== undefined) { clauses.push('e.followed=?'); params.push(bool(q.followed, ErrorCodes.INVALID_ENTITY_FILTER, 'followed')); } if (q.q) { clauses.push('e.name LIKE ?'); params.push(`%${q.q}%`); }
-    const rows = (app.db.prepare(`SELECT e.entity_id entityId,e.entity_type entityType,e.name,e.summary,e.followed,(SELECT count(*) FROM signal_entities se WHERE se.entity_id=e.entity_id) signalCount,e.first_seen_at firstSeenAt,e.last_seen_at lastSeenAt,(SELECT json_object('signalId',ee.signal_id,'eventType',ee.event_type,'eventAt',ee.event_at,'headline',ee.headline) FROM entity_events ee WHERE ee.entity_id=e.entity_id ORDER BY ee.event_at DESC LIMIT 1) latestEventJson FROM entities e ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${q.sort === 'signals' ? 'signalCount DESC,e.last_seen_at DESC' : 'e.last_seen_at DESC'} LIMIT ?`).all(...params, limit) as Record<string, unknown>[]).map((row) => ({ ...row, latestEvent: parseJson(row.latestEventJson, null) }));
-    return reply.send({ code: 0, message: 'success', data: page(rows), requestId: request.id });
+    const count = '(SELECT count(*) FROM signal_entities se WHERE se.entity_id=e.entity_id)';
+    const keys = q.sort === 'signals' ? [count, 'e.last_seen_at', 'e.entity_id'] : ['e.last_seen_at', 'e.entity_id'];
+    const cursor = readCursor('entities', q, keys.length);
+    if (cursor) { clauses.push(`(${keys.join(',')}) < (${keys.map(() => '?').join(',')})`); params.push(...cursor); }
+    const rows = (app.db.prepare(`SELECT e.entity_id entityId,e.entity_type entityType,e.name,e.summary,e.followed,${count} signalCount,e.first_seen_at firstSeenAt,e.last_seen_at lastSeenAt,(SELECT json_object('signalId',ee.signal_id,'eventType',ee.event_type,'eventAt',ee.event_at,'headline',ee.headline) FROM entity_events ee WHERE ee.entity_id=e.entity_id ORDER BY ee.event_at DESC LIMIT 1) latestEventJson FROM entities e ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${keys.map((key) => `${key} DESC`).join(',')} LIMIT ?`).all(...params, limit + 1) as { signalCount: number; lastSeenAt: string; entityId: number; latestEventJson: string }[]).map((row) => ({ ...row, latestEvent: parseJson(row.latestEventJson, null) }));
+    return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('entities', q, q.sort === 'signals' ? [Number(row.signalCount), String(row.lastSeenAt), Number(row.entityId)] : [String(row.lastSeenAt), Number(row.entityId)])), requestId: request.id });
   });
 
   app.get('/api/entities/:entityId', async (request, reply) => {
     const id = parsePositiveId((request.params as { entityId: string }).entityId); const q = request.query as Record<string, unknown>; const eventLimit = q.eventLimit === undefined ? 50 : parseLimit(q.eventLimit);
     const entity = app.db.prepare('SELECT * FROM entities WHERE entity_id=?').get(id) as Record<string, unknown> | undefined; if (!entity) throw new BusinessError(ErrorCodes.ENTITY_NOT_FOUND);
-    const events = app.db.prepare('SELECT ee.signal_id signalId,ee.event_type eventType,ee.event_at eventAt,ee.headline,s.title signalTitle,s.evidence_level evidenceLevel,s.value_score valueScore FROM entity_events ee JOIN signals s ON s.signal_id=ee.signal_id WHERE ee.entity_id=? ORDER BY ee.event_at DESC LIMIT ?').all(id, eventLimit);
-    return reply.send({ code: 0, message: 'success', data: { entityId: id, entityType: entity.entity_type, name: entity.name, summary: entity.summary, followed: entity.followed, firstSeenAt: entity.first_seen_at, lastSeenAt: entity.last_seen_at, events: page(events) }, requestId: request.id });
+    const eventQuery: Record<string, unknown> = { ...q, cursor: q.eventCursor }; delete eventQuery.eventCursor;
+    const cursor = readCursor(`entity-events-${id}`, eventQuery, 3);
+    const events = app.db.prepare(`SELECT ee.signal_id signalId,ee.event_type eventType,ee.event_at eventAt,ee.headline,s.title signalTitle,s.evidence_level evidenceLevel,s.value_score valueScore FROM entity_events ee JOIN signals s ON s.signal_id=ee.signal_id WHERE ee.entity_id=? ${cursor ? 'AND (ee.event_at,ee.signal_id,ee.event_type) < (?,?,?)' : ''} ORDER BY ee.event_at DESC,ee.signal_id DESC,ee.event_type DESC LIMIT ?`).all(id, ...(cursor ?? []), eventLimit + 1) as { eventAt: string; signalId: number; eventType: string }[];
+    return reply.send({ code: 0, message: 'success', data: { entityId: id, entityType: entity.entity_type, name: entity.name, summary: entity.summary, followed: entity.followed, firstSeenAt: entity.first_seen_at, lastSeenAt: entity.last_seen_at, events: paged(events, eventLimit, (row) => writeCursor(`entity-events-${id}`, eventQuery, [row.eventAt, row.signalId, row.eventType])) }, requestId: request.id });
   });
 
   app.put('/api/entities/:entityId/follow', async (request, reply) => {

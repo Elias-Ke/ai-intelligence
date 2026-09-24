@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { BusinessError, ErrorCodes } from '../domain/errorCodes.js';
 import { now, parseLimit } from '../http.js';
 import { publicUrl } from '../ingestion/publicHttp.js';
+import { paged, readCursor, writeCursor } from './cursor.js';
 
 const kinds = ['rss', 'api', 'web'] as const;
 const languages = ['zh-CN', 'en', 'mixed'] as const;
@@ -25,9 +26,11 @@ export function registerSourceRoutes(app: FastifyInstance) {
     if (query.kind) { clauses.push('kind = ?'); params.push(String(query.kind)); }
     if (query.region) { clauses.push('region = ?'); params.push(String(query.region)); }
     if (enabled !== undefined) { clauses.push('enabled = ?'); params.push(enabled); }
+    const cursor = readCursor('sources', query, 1);
+    if (cursor) { clauses.push('source_id > ?'); params.push(cursor[0]); }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const rows = app.db.prepare(`SELECT source_id sourceId,name,source_group sourceGroup,kind,url,language,region,trust_level trustLevel,enabled,fetch_interval_minutes fetchIntervalMinutes,last_checked_at lastCheckedAt,last_success_at lastSuccessAt,last_error_code lastErrorCode FROM sources ${where} ORDER BY source_id LIMIT ?`).all(...params, limit) as unknown[];
-    return reply.send({ code: 0, message: 'success', data: { items: rows, nextCursor: null }, requestId: request.id });
+    const rows = app.db.prepare(`SELECT source_id sourceId,name,source_group sourceGroup,kind,url,language,region,trust_level trustLevel,enabled,fetch_interval_minutes fetchIntervalMinutes,last_checked_at lastCheckedAt,last_success_at lastSuccessAt,last_error_code lastErrorCode FROM sources ${where} ORDER BY source_id LIMIT ?`).all(...params, limit + 1) as { sourceId: number }[];
+    return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('sources', query, [row.sourceId])), requestId: request.id });
   });
 
   app.post('/api/sources', async (request, reply) => {

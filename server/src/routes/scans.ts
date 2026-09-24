@@ -9,6 +9,7 @@ import { analyzeDiscoveries } from '../domain/analyzeDiscoveries.js';
 import { updateTrends } from '../domain/trends.js';
 import { extractArticle } from '../ingestion/extractArticle.js';
 import { generateCards } from '../generation/cards.js';
+import { paged, readCursor, writeCursor } from './cursor.js';
 
 const activeStatuses = ['created', 'collecting', 'normalizing', 'clustering', 'analyzing', 'generating', 'retrying'];
 const steps = ['collecting', 'normalizing', 'clustering', 'analyzing', 'generating'] as const;
@@ -228,8 +229,11 @@ export function registerScanRoutes(app: FastifyInstance) {
     const query = request.query as Record<string, unknown>; const limit = parseLimit(query.limit);
     const statuses = ['created', ...activeStatuses.slice(1), 'completed', 'partial_failed', 'failed'];
     if (query.status !== undefined && !statuses.includes(String(query.status))) throw new BusinessError(ErrorCodes.INVALID_SCAN_FILTER);
-    const rows = app.db.prepare(`SELECT * FROM scan_tasks ${query.status ? 'WHERE status = ?' : ''} ORDER BY created_at DESC LIMIT ?`).all(...(query.status ? [String(query.status), limit] : [limit])) as Record<string, unknown>[];
-    return reply.send({ code: 0, message: 'success', data: { items: rows.map(taskView), nextCursor: null }, requestId: request.id });
+    const cursor = readCursor('scans', query, 2);
+    const filters = [query.status ? 'status = ?' : '', cursor ? '(created_at,task_id) < (?,?)' : ''].filter(Boolean);
+    const rows = app.db.prepare(`SELECT * FROM scan_tasks ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''} ORDER BY created_at DESC,task_id DESC LIMIT ?`).all(...(query.status ? [String(query.status)] : []), ...(cursor ?? []), limit + 1) as Record<string, unknown>[];
+    const result = paged(rows, limit, (row) => writeCursor('scans', query, [String(row.created_at), Number(row.task_id)]));
+    return reply.send({ code: 0, message: 'success', data: { ...result, items: result.items.map(taskView) }, requestId: request.id });
   });
 
   app.get('/api/scans/:taskId', async (request, reply) => {
