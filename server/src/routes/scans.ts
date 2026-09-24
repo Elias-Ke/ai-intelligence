@@ -23,6 +23,7 @@ function taskView(row: Record<string, unknown>) { return { taskId: row.task_id, 
 export async function executeScan(app: FastifyInstance, taskId: number, rangeFrom: Date, rangeTo: Date) {
   const startedAt = now();
   app.db.prepare("UPDATE scan_tasks SET status='collecting',current_step='collecting',started_at=?,heartbeat_at=? WHERE task_id=?").run(startedAt, startedAt, taskId);
+  app.taskEvents.emit('changed', taskId);
   const sources = app.db.prepare('SELECT source_id sourceId,url,kind FROM sources WHERE enabled=1 ORDER BY source_id').all() as { sourceId: number; url: string; kind: 'rss' | 'api' | 'web' }[];
   let failed = 0; let discovered = 0;
   const saveDiscovery = app.db.transaction((sourceId: number | null, url: string, title: string, content: string, channel: 'source' | 'anysearch', publishedAt: string | null) => {
@@ -47,6 +48,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     await Promise.all(Array.from({ length: 5 }, () => searchWorker()));
   }
   app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,heartbeat_at=? WHERE task_id=?').run('analyzing', 'analyzing', 70, discovered, now(), taskId);
+  app.taskEvents.emit('changed', taskId);
   const discoveries = app.db.prepare("SELECT d.* FROM raw_discoveries d JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id WHERE sd.task_id=? AND d.status='accepted' ORDER BY d.discovery_id").all(taskId) as Record<string, unknown>[];
   let signals = 0;
   for (const discovery of discoveries) {
@@ -58,7 +60,25 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   }
   const finalStatus = failed && discovered ? 'partial_failed' : failed ? 'failed' : 'completed';
   app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,signal_count=?,opportunity_count=?,content_topic_count=?,finished_at=?,heartbeat_at=? WHERE task_id=?').run(finalStatus, 'generating', 100, discovered, signals, 0, 0, now(), now(), taskId);
+  app.taskEvents.emit('changed', taskId);
   app.log.info({ event: finalStatus === 'completed' ? 'scan.task.completed' : 'scan.task.partial_failed', taskId, discovered, signals, opportunities: 0, topics: 0, failed }, 'scan task finished');
+}
+
+export async function runScan(app: FastifyInstance, taskId: number) {
+  try {
+    const task = app.db.prepare('SELECT range_from rangeFrom,range_to rangeTo FROM scan_tasks WHERE task_id=?').get(taskId) as { rangeFrom: string; rangeTo: string } | undefined;
+    if (!task) return;
+    await executeScan(app, taskId, new Date(task.rangeFrom), new Date(task.rangeTo));
+  } catch (error) {
+    const code = error instanceof BusinessError ? error.code : ErrorCodes.INTERNAL;
+    app.db.prepare("UPDATE scan_tasks SET status='failed',error_code=?,error_message=?,finished_at=?,heartbeat_at=? WHERE task_id=?").run(code, '扫描执行失败，请重试', now(), now(), taskId);
+    app.taskEvents.emit('changed', taskId);
+    app.log.error({ event: 'scan.task.failed', taskId, businessCode: code }, 'scan task failed');
+  }
+}
+
+function scheduleScan(app: FastifyInstance, taskId: number) {
+  if (app.autoRunScans) setImmediate(() => { void runScan(app, taskId); });
 }
 
 export function registerScanRoutes(app: FastifyInstance) {
@@ -78,7 +98,7 @@ export function registerScanRoutes(app: FastifyInstance) {
     const result = app.db.prepare('INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,?,?,?,?)').run(key, from.toISOString(), to.toISOString(), 'created', createdAt);
     const row = app.db.prepare('SELECT * FROM scan_tasks WHERE task_id = ?').get(result.lastInsertRowid) as Record<string, unknown>;
     app.log.info({ event: 'scan.task.created', taskId: result.lastInsertRowid, rangeFrom: from.toISOString(), rangeTo: to.toISOString() }, 'scan task created');
-    if (process.env.NODE_ENV !== 'test') void executeScan(app, Number(result.lastInsertRowid), from, to);
+    scheduleScan(app, Number(result.lastInsertRowid));
     return reply.code(202).send({ code: 0, message: 'success', data: { ...taskView(row), reused: false }, requestId: request.id });
   });
 
@@ -107,6 +127,8 @@ export function registerScanRoutes(app: FastifyInstance) {
     const active = app.db.prepare(`SELECT task_id FROM scan_tasks WHERE status IN (${activeStatuses.map(() => '?').join(',')}) LIMIT 1`).get(...activeStatuses);
     if (active) throw new BusinessError(ErrorCodes.ACTIVE_SCAN_EXISTS);
     app.db.prepare("UPDATE scan_tasks SET status='retrying',error_code=NULL,error_message=NULL WHERE task_id=?").run(id);
+    app.taskEvents.emit('changed', id);
+    scheduleScan(app, id);
     return reply.code(202).send({ code: 0, message: 'success', data: { taskId: id, status: 'retrying', resumeFromStep: row.current_step ?? 'collecting', reused: true }, requestId: request.id });
   });
 
@@ -115,10 +137,25 @@ export function registerScanRoutes(app: FastifyInstance) {
     const id = parsePositiveId((request.params as { taskId: string }).taskId);
     const row = app.db.prepare('SELECT * FROM scan_tasks WHERE task_id = ?').get(id) as Record<string, unknown> | undefined;
     if (!row) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
+    const lastEventId = request.headers['last-event-id'];
+    if (lastEventId !== undefined && (typeof lastEventId !== 'string' || !/^\d{1,20}$/.test(lastEventId))) throw new BusinessError(ErrorCodes.INVALID_REQUEST, { field: 'Last-Event-ID' });
     reply.hijack();
     reply.raw.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    reply.raw.write(`event: task_snapshot\ndata: ${JSON.stringify({ taskId: id, status: row.status, currentStep: row.current_step, progress: row.progress, discoveredCount: row.discovered_count, signalCount: row.signal_count })}\n\n`);
-    if (['completed', 'partial_failed', 'failed'].includes(String(row.status))) reply.raw.write(`event: task_${row.status === 'completed' ? 'completed' : 'failed'}\ndata: ${JSON.stringify(taskView(row))}\n\n`);
-    reply.raw.end();
+    let closed = false;
+    const cleanup = () => { if (closed) return; closed = true; clearInterval(heartbeat); app.taskEvents.off('changed', sendSnapshot); };
+    const send = (event: string, data: unknown) => { if (!closed) reply.raw.write(`id: ${Date.now()}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+    const sendSnapshot = (changedId: number) => {
+      if (changedId !== id || closed) return;
+      const latest = app.db.prepare('SELECT * FROM scan_tasks WHERE task_id=?').get(id) as Record<string, unknown>;
+      send('task_snapshot', taskView(latest));
+      if (['completed', 'partial_failed', 'failed'].includes(String(latest.status))) {
+        send(latest.status === 'completed' ? 'task_completed' : 'task_failed', taskView(latest));
+        cleanup(); reply.raw.end();
+      }
+    };
+    const heartbeat = setInterval(() => send('heartbeat', { timestamp: now() }), 15_000);
+    reply.raw.on('close', cleanup);
+    app.taskEvents.on('changed', sendSnapshot);
+    sendSnapshot(id);
   });
 }

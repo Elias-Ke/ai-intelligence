@@ -11,7 +11,7 @@ test('scan keeps undated articles as raw discoveries without inventing cards', a
   const dir = mkdtempSync(join(tmpdir(), 'ai-intelligence-scan-'));
   const db = openDatabase(join(dir, 'test.db'));
   db.prepare('UPDATE sources SET enabled=0 WHERE source_id!=1').run();
-  const app = createApp({ db, logger: false, fetchSource: async (url) => ({ url, contentType: 'text/html', text: '<main><article><h2><a href="/news/agent-case">Agent deployment in real workflows</a></h2><p>Reported by the company</p></article></main>' }) });
+  const app = createApp({ db, logger: false, autoRunScans: false, fetchSource: async (url) => ({ url, contentType: 'text/html', text: '<main><article><h2><a href="/news/agent-case">Agent deployment in real workflows</a></h2><p>Reported by the company</p></article></main>' }) });
   try {
     const result = await app.inject({ method: 'POST', url: '/api/scans', headers: { 'idempotency-key': 'undated-article' }, payload: { range: '24h' } });
     const taskId = result.json().data.taskId as number;
@@ -32,7 +32,7 @@ test('scan analyzes only entries whose publication date is inside its range', as
   db.prepare("UPDATE sources SET kind='rss' WHERE source_id=1").run();
   const current = new Date(Date.now() - 3_600_000).toUTCString();
   const old = new Date(Date.now() - 10 * 86_400_000).toUTCString();
-  const app = createApp({ db, logger: false, fetchSource: async (url) => ({ url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>New AI deployment in schools</title><link>https://example.org/new-ai</link><description>School workflow</description><pubDate>${current}</pubDate></item><item><title>Old AI deployment in schools</title><link>https://example.org/old-ai</link><description>Old workflow</description><pubDate>${old}</pubDate></item></channel></rss>` }) });
+  const app = createApp({ db, logger: false, autoRunScans: false, fetchSource: async (url) => ({ url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>New AI deployment in schools</title><link>https://example.org/new-ai</link><description>School workflow</description><pubDate>${current}</pubDate></item><item><title>Old AI deployment in schools</title><link>https://example.org/old-ai</link><description>Old workflow</description><pubDate>${old}</pubDate></item></channel></rss>` }) });
   try {
     const result = await app.inject({ method: 'POST', url: '/api/scans', headers: { 'idempotency-key': 'dated-articles' }, payload: { range: '24h' } });
     const taskId = result.json().data.taskId as number;

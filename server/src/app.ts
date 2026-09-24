@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import type { SqliteDatabase } from './persistence/database.js';
 import { ErrorCodes, BusinessError } from './domain/errorCodes.js';
 import { registerSourceRoutes } from './routes/sources.js';
@@ -7,17 +8,19 @@ import { registerScanRoutes } from './routes/scans.js';
 import { registerResultRoutes } from './routes/results.js';
 import { fetchPublic } from './ingestion/publicHttp.js';
 
-export type AppOptions = { db: SqliteDatabase; version?: string; logger?: boolean; fetchSource?: typeof fetchPublic };
+export type AppOptions = { db: SqliteDatabase; version?: string; logger?: boolean; fetchSource?: typeof fetchPublic; autoRunScans?: boolean };
 
 declare module 'fastify' {
-  interface FastifyInstance { db: SqliteDatabase; appVersion: string; fetchSource: typeof fetchPublic; }
+  interface FastifyInstance { db: SqliteDatabase; appVersion: string; fetchSource: typeof fetchPublic; autoRunScans: boolean; taskEvents: EventEmitter; }
 }
 
-export function createApp({ db, version = '0.1.0', logger = true, fetchSource = fetchPublic }: AppOptions): FastifyInstance {
+export function createApp({ db, version = '0.1.0', logger = true, fetchSource = fetchPublic, autoRunScans = true }: AppOptions): FastifyInstance {
   const app = Fastify({ logger, genReqId: () => `req_${randomUUID()}` });
   app.decorate('db', db);
   app.decorate('appVersion', version);
   app.decorate('fetchSource', fetchSource);
+  app.decorate('autoRunScans', autoRunScans);
+  app.decorate('taskEvents', new EventEmitter());
 
   app.addHook('onRequest', (request, _reply, done) => {
     (request as typeof request & { startedAt?: bigint }).startedAt = process.hrtime.bigint();

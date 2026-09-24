@@ -7,7 +7,7 @@ import { createApp } from '../../src/app.js';
 import { openDatabase } from '../../src/persistence/database.js';
 
 async function fixture() {
-  const directory = mkdtempSync(join(tmpdir(), 'ai-intelligence-')); const db = openDatabase(join(directory, 'test.db')); const app = createApp({ db, logger: false }); await app.ready();
+  const directory = mkdtempSync(join(tmpdir(), 'ai-intelligence-')); const db = openDatabase(join(directory, 'test.db')); const app = createApp({ db, logger: false, autoRunScans: false }); await app.ready();
   const timestamp = new Date().toISOString();
   const signal = db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,has_conflict,score_explanation_json,rules_version,state,event_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run('matrix-signal', 'Matrix signal', 'summary', 'technology', 60, 60, 60, 60, 60, 60, 60, 60, 'single_source', 0, '{}', 'v1', 'active', timestamp, timestamp, timestamp);
   const signalId = Number(signal.lastInsertRowid);
