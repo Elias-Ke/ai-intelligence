@@ -5,7 +5,7 @@ import { now, parseLimit, parsePositiveId } from '../http.js';
 import { parseSource } from '../ingestion/parseSource.js';
 import { publicUrl } from '../ingestion/publicHttp.js';
 import { buildSearchQueries, QUERY_VERSION } from '../ingestion/searchQueries.js';
-import { scoreDiscovery } from '../domain/scoring.js';
+import { analyzeDiscoveries } from '../domain/analyzeDiscoveries.js';
 import { generateCards } from '../generation/cards.js';
 
 const activeStatuses = ['created', 'collecting', 'normalizing', 'clustering', 'analyzing', 'generating', 'retrying'];
@@ -100,18 +100,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   }
   app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,heartbeat_at=? WHERE task_id=?').run('analyzing', 'analyzing', 70, discovered, now(), taskId);
   app.taskEvents.emit('changed', taskId);
-  const discoveries = app.db.prepare("SELECT d.*,src.trust_level trustLevel FROM raw_discoveries d JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE sd.task_id=? AND d.status='accepted' ORDER BY d.discovery_id").all(taskId) as Record<string, unknown>[];
-  let signals = 0;
-  for (const discovery of discoveries) {
-    const timestamp = now(); const title = String(discovery.title || discovery.url); const summary = String(discovery.snippet || '').slice(0, 500); const clusterKey = createHash('sha1').update(`${discovery.normalized_url}:${discovery.content_hash}`).digest('hex');
-    const assessment = scoreDiscovery({ title, snippet: summary, trustLevel: Number(discovery.trustLevel || 0), publishedAt: String(discovery.published_at ?? '') });
-    if (assessment.relevance < 35) continue;
-    app.db.prepare("INSERT OR IGNORE INTO signals(cluster_key,title,summary,signal_type,tags_text,search_text,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,has_conflict,score_explanation_json,rules_version,state,event_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(clusterKey, title, summary, assessment.type, 'AI', `${title} ${summary}`, assessment.relevance, assessment.scores.novelty, assessment.scores.truth, assessment.scores.technology, assessment.scores.adoption, assessment.scores.monetization, assessment.scores.contentValue, assessment.value, assessment.evidenceLevel, 0, JSON.stringify(assessment.explanation), 'v1', assessment.value >= 65 ? 'active' : 'needs_review', discovery.published_at, timestamp, timestamp);
-    const signal = app.db.prepare('SELECT signal_id signalId FROM signals WHERE cluster_key=?').get(clusterKey) as { signalId: number };
-    app.db.prepare('INSERT OR IGNORE INTO scan_signals(task_id,signal_id,rank_no,is_highlight,created_at) VALUES(?,?,?,?,?)').run(taskId, signal.signalId, ++signals, 0, timestamp);
-    app.db.prepare("INSERT OR IGNORE INTO signal_sources(signal_id,discovery_id,relation_type,is_independent,added_at) VALUES(?,?,?,?,?)").run(signal.signalId, discovery.discovery_id, 'primary', 1, timestamp);
-    app.log.info({ event: 'analysis.signal.scored', taskId, signalId: signal.signalId, discoveryId: discovery.discovery_id, rulesVersion: 'v1', relevanceScore: assessment.relevance, valueScore: assessment.value, evidenceCount: 1 }, 'signal scored');
-  }
+  const signals = analyzeDiscoveries(app, taskId);
   app.db.prepare("UPDATE scan_tasks SET status='generating',current_step='generating',progress=85,signal_count=?,heartbeat_at=? WHERE task_id=?").run(signals, now(), taskId);
   app.taskEvents.emit('changed', taskId);
   const generated = await generateCards(app, taskId);
