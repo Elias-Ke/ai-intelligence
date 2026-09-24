@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../../src/app.js';
 import { openDatabase } from '../../src/persistence/database.js';
+import { hasLlmConfig } from '../../src/generation/LlmClient.js';
+import { AnySearchClient } from '../../src/ingestion/AnySearchClient.js';
 
 test('API-21-N01 health reports SQLite, FTS5 and version', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'ai-intelligence-'));
@@ -13,7 +15,7 @@ test('API-21-N01 health reports SQLite, FTS5 and version', async (t) => {
   t.after(async () => { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); });
   const response = await app.inject('/api/system/health');
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(response.json().data, { status: 'ok', database: 'ok', fts5: 'ok', activeTaskId: null, version: 'test' });
+  assert.deepEqual(response.json().data, { status: 'ok', database: 'ok', fts5: 'ok', activeTaskId: null, version: 'test', capabilities: { anySearch: app.searchClient !== null, llm: hasLlmConfig() } });
   assert.equal(response.json().code, 0);
   assert.match(response.json().requestId, /^req_/);
 });
@@ -27,6 +29,22 @@ test('C01 migration is idempotent and FTS stays synchronized', () => {
   db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,rules_version,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run('cluster-1', 'AI signal', 'summary', 'technology', 50, 50, 50, 50, 50, 50, 50, 50, 'single_source', 'v1', 'active', now, now);
   assert.equal((db.prepare("SELECT count(*) AS count FROM signals_fts WHERE signals_fts MATCH 'AI'").get() as { count: number }).count, 1);
   db.close(); rmSync(directory, { recursive: true, force: true });
+});
+
+test('health reports integration capability independently of database readiness', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-health-capabilities-'));
+  const db = openDatabase(join(directory, 'test.db'));
+  const previous = { base: process.env.LLM_BASE_URL, key: process.env.LLM_API_KEY, model: process.env.LLM_MODEL };
+  delete process.env.LLM_BASE_URL; delete process.env.LLM_API_KEY; delete process.env.LLM_MODEL;
+  const app = createApp({ db, logger: false, searchClient: new AnySearchClient('https://example.org', 'unused') });
+  try {
+    assert.deepEqual((await app.inject('/api/system/health')).json().data.capabilities, { anySearch: true, llm: false });
+    process.env.LLM_BASE_URL = 'https://example.org'; process.env.LLM_API_KEY = 'unused'; process.env.LLM_MODEL = 'test';
+    assert.deepEqual((await app.inject('/api/system/health')).json().data.capabilities, { anySearch: true, llm: true });
+  } finally {
+    await app.close(); db.close(); rmSync(directory, { recursive: true, force: true });
+    for (const [key, value] of Object.entries({ LLM_BASE_URL: previous.base, LLM_API_KEY: previous.key, LLM_MODEL: previous.model })) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
 });
 
 test('API-21 returns numeric error codes for unavailable database and FTS5', async (t) => {

@@ -8,6 +8,7 @@ import { registerScanRoutes } from './routes/scans.js';
 import { registerResultRoutes } from './routes/results.js';
 import { fetchPublic } from './ingestion/publicHttp.js';
 import { AnySearchClient } from './ingestion/AnySearchClient.js';
+import { hasLlmConfig } from './generation/LlmClient.js';
 
 export type AppOptions = { db: SqliteDatabase; version?: string; logger?: boolean; fetchSource?: typeof fetchPublic; autoRunScans?: boolean; searchClient?: AnySearchClient };
 
@@ -53,7 +54,7 @@ export function createApp({ db, version = '0.1.0', logger = true, fetchSource = 
     try {
       app.db.prepare('SELECT 1 FROM signals_fts LIMIT 1').get();
       const active = app.db.prepare("SELECT task_id FROM scan_tasks WHERE status IN ('created','collecting','normalizing','clustering','analyzing','generating','retrying') LIMIT 1").get() as { task_id?: number } | undefined;
-      return reply.send({ code: 0, message: 'success', data: { status: 'ok', database: 'ok', fts5: 'ok', activeTaskId: active?.task_id ?? null, version: app.appVersion }, requestId: request.id });
+      return reply.send({ code: 0, message: 'success', data: { status: 'ok', database: 'ok', fts5: 'ok', activeTaskId: active?.task_id ?? null, version: app.appVersion, capabilities: { anySearch: app.searchClient !== null, llm: hasLlmConfig() } }, requestId: request.id });
     } catch (error) {
       const isFts = error instanceof Error && /fts/i.test(error.message);
       const code = isFts ? ErrorCodes.FTS_UNAVAILABLE : ErrorCodes.DATABASE_UNAVAILABLE;

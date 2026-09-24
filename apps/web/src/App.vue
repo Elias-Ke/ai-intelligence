@@ -14,6 +14,7 @@ const discoveryStatus = ref(''); const discoveryTaskId = ref<number | null>(null
 const selectedTaskId = ref<number | null>(null); const scanDates = ref<[Date, Date] | null>(null); const signalType = ref(''); const evidenceLevel = ref(''); const signalSort = ref('value');
 const listStatus = ref(''); const platform = ref(''); const historyStatus = ref(''); const sourceKind = ref(''); const sourceGroup = ref(''); const savedTarget = ref<'signal' | 'opportunity' | 'content_topic'>('signal');
 const sourceDialog = ref(false); const sourceSaving = ref(false); const sourceUrlError = ref('');
+const capabilities = ref<{ anySearch: boolean; llm: boolean } | null>(null); const healthError = ref('');
 const lastRequestId = ref(''); let pendingScanKey: string | null = null;
 const newSource = reactive({ name: '', sourceGroup: '新发现候选', kind: 'web', url: '', language: 'mixed', region: 'global', trustLevel: 1, enabled: false, fetchIntervalMinutes: 1440 });
 const detailsOpen = computed({ get: () => details.value !== null, set: (open: boolean) => { if (!open) details.value = null; } });
@@ -58,6 +59,13 @@ async function loadView(more = false) {
   finally { if (version === loadVersion) loading.value = false; }
 }
 function loadSignals() { return loadView(); }
+async function loadHealth() {
+  try {
+    const body = await (await fetch('/api/system/health')).json();
+    if (body.code !== 0) throw new Error(`${body.message}（错误码 ${body.code}，${body.requestId}）`);
+    capabilities.value = body.data.capabilities; healthError.value = '';
+  } catch (error) { capabilities.value = null; healthError.value = error instanceof Error ? error.message : '服务健康状态获取失败'; }
+}
 async function openDetails(type: 'signals' | 'opportunities' | 'content-topics' | 'entities' | 'scans', id: number) {
   details.value = { type, id }; detailsLoading.value = true;
   try {
@@ -166,7 +174,7 @@ function go(next: View) { view.value = next; query.value = ''; nextCursor.value 
 function showTaskResults(id: number, destination: 'stream' | 'discoveries') {
   view.value = destination; selectedTaskId.value = destination === 'stream' ? id : null; discoveryTaskId.value = destination === 'discoveries' ? id : null; void loadView();
 }
-onMounted(() => { void loadView(); void restoreTask(); });
+onMounted(() => { void loadView(); void restoreTask(); void loadHealth(); });
 onBeforeUnmount(() => { clearProgressConnection(); listController?.abort(); });
 </script>
 
@@ -179,7 +187,9 @@ onBeforeUnmount(() => { clearProgressConnection(); listController?.abort(); });
       <div class="sidebar-foot"><strong>单人工作台</strong>手动触发扫描，结果沉淀为个人判断库。</div>
     </aside>
     <main class="main">
-      <header class="topbar"><div><div class="eyebrow">SIGNAL / AI INTELLIGENCE</div><h1>{{ title }}</h1><p>把 AI 前沿变化整理成可核查的信号、可验证的副业机会和可持续的内容选题。</p></div><div class="top-actions"><el-button :icon="Refresh" circle aria-label="刷新" @click="loadView()" /><el-button type="primary" :icon="Plus" :loading="starting" @click="createScan">开始扫描</el-button></div></header>
+      <header class="topbar"><div><div class="eyebrow">SIGNAL / AI INTELLIGENCE</div><h1>{{ title }}</h1><p>把 AI 前沿变化整理成可核查的信号、可验证的副业机会和可持续的内容选题。</p></div><div class="top-actions"><el-button :icon="Refresh" circle aria-label="刷新" @click="loadView(); loadHealth()" /><el-button type="primary" :icon="Plus" :loading="starting" @click="createScan">开始扫描</el-button></div></header>
+      <el-alert v-if="healthError" :title="healthError" type="error" :closable="false" show-icon class="system-alert" />
+      <el-alert v-else-if="capabilities && (!capabilities.anySearch || !capabilities.llm)" :title="`未就绪：${[!capabilities.anySearch && 'AnySearch 全网搜索', !capabilities.llm && '模型机会/选题生成'].filter(Boolean).join('、')}。请检查服务配置。`" type="warning" :closable="false" show-icon class="system-alert" />
       <section v-if="view === 'dashboard'" class="scan-panel">
         <div><h2>手动触发一轮情报扫描</h2></div>
         <div class="scan-controls"><el-select v-model="scanRange" style="width:150px"><el-option label="过去 24 小时" value="24h" /><el-option label="过去 3 天" value="3d" /><el-option label="过去 7 天" value="7d" /><el-option label="自定义" value="custom" /></el-select><el-date-picker v-if="scanRange === 'custom'" v-model="scanDates" type="datetimerange" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" /><el-button type="primary" :icon="Search" :loading="starting" @click="createScan">开始扫描</el-button></div>
