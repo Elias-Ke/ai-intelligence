@@ -49,15 +49,26 @@ async function loadView(more = false) {
   loading.value = true;
   try {
     const path = endpoint();
+    if (view.value === 'dashboard') {
+      if (!activeTaskId.value) return;
+      const readSignals = async (url: string): Promise<Signal[]> => {
+        const body = await (await fetch(url, { signal: controller.signal })).json();
+        if (body.code !== 0) throw new Error(`${body.message}（${body.code}，${body.requestId}）`);
+        return body.data.items;
+      };
+      const base = `${path}&state=active&ignored=false`;
+      const highlighted = await readSignals(`${base}&highlighted=true&limit=5`);
+      const remaining = highlighted.length < 5 ? await readSignals(`${base}&limit=10`) : [];
+      if (version !== loadVersion) return;
+      signals.value = [...highlighted, ...remaining.filter((item) => !highlighted.some((featured) => featured.signalId === item.signalId))].slice(0, 5);
+      return;
+    }
     const cursor = more && nextCursor.value ? `&cursor=${encodeURIComponent(nextCursor.value)}` : '';
     const response = await fetch(`${path}&limit=30${cursor}`, { signal: controller.signal });
     const body = await response.json();
     if (version !== loadVersion) return;
     if (body.code !== 0) throw new Error(`${body.message}（${body.code}，${body.requestId}）`);
-    if (view.value === 'dashboard' || view.value === 'stream') {
-      signals.value = more ? [...signals.value, ...body.data.items] : body.data.items;
-      if (view.value === 'dashboard') signals.value.sort((a, b) => Number(b.isHighlighted || 0) - Number(a.isHighlighted || 0));
-    }
+    if (view.value === 'stream') signals.value = more ? [...signals.value, ...body.data.items] : body.data.items;
     else records.value = more ? [...records.value, ...body.data.items] : body.data.items;
     nextCursor.value = body.data.nextCursor;
   } catch (error) { if (version === loadVersion && !controller.signal.aborted) ElMessage.error(error instanceof Error ? error.message : '数据加载失败'); }
@@ -201,7 +212,7 @@ async function updateItemState(row: Record<string, any>, type: 'signal' | 'oppor
   const previous = { saved: target.saved, ignored: target.ignored, valueRating: target.valueRating };
   const next = { ...patch, ...(patch.saved === true ? { ignored: false } : {}), ...(patch.ignored === true ? { saved: false } : {}) };
   Object.assign(target, next);
-  try { Object.assign(target, await requestJson(`/api/item-states/${type}/${id}`, 'PUT', next)); ElMessage.success('已保存'); if (view.value === 'saved' && next.saved === false) void loadView(); }
+  try { Object.assign(target, await requestJson(`/api/item-states/${type}/${id}`, 'PUT', next)); ElMessage.success('已保存'); if ((view.value === 'saved' && next.saved === false) || (view.value === 'dashboard' && type === 'signal' && next.ignored === true)) void loadView(); }
   catch (error) { Object.assign(target, previous); ElMessage.error(error instanceof Error ? error.message : '保存失败'); }
 }
 function rateSignal(rating: number) { if (details.value) void updateItemState(details.value, 'signal', details.value.signalId, { valueRating: rating }); }
@@ -216,7 +227,7 @@ async function followEntity(row: Record<string, any>) {
 async function archiveSignal(row: Record<string, any>) {
   const next = row.state === 'archived' ? 'active' : 'archived';
   if (next === 'archived') { try { await ElMessageBox.confirm(`归档「${row.title}」后仍可从筛选中找回。`, '归档情报', { confirmButtonText: '归档', cancelButtonText: '取消' }); } catch { return; } }
-  try { row.state = (await requestJson(`/api/signals/${row.signalId}/state`, 'PATCH', { state: next })).state; ElMessage.success(next === 'archived' ? '已归档' : '已恢复'); }
+  try { row.state = (await requestJson(`/api/signals/${row.signalId}/state`, 'PATCH', { state: next })).state; ElMessage.success(next === 'archived' ? '已归档' : '已恢复'); if (view.value === 'dashboard') void loadView(); }
   catch (error) { ElMessage.error(error instanceof Error ? error.message : '归档失败'); }
 }
 async function retryTask(row: Record<string, any>) {

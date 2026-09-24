@@ -86,3 +86,22 @@ test('value feedback changes list priority and platform filter matches exact JSO
     assert.equal((await app.inject('/api/opportunities?opportunityType=invalid')).json().code, 500001);
   } finally { await close(); }
 });
+
+test('featured signals remain queryable beyond the first value-sorted page', async () => {
+  const { db, app, close } = await fixture();
+  try {
+    const time = new Date().toISOString();
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('featured-test','2026-09-23','2026-09-24','completed',?)").run(time).lastInsertRowid);
+    const insert = db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,rules_version,state,event_at,created_at,updated_at) VALUES(?,?,?,'technology',60,60,60,60,60,60,60,?,'first_party','v1',?,?,?,?)");
+    for (let i = 0; i < 35; i++) {
+      const id = Number(insert.run(`normal-${i}`, `Normal ${i}`, 'summary', 90, 'active', time, time, time).lastInsertRowid);
+      db.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,created_at) VALUES(?,?,?,?)').run(taskId, id, i + 1, time);
+    }
+    const featured = Number(insert.run('featured', 'Featured', 'summary', 40, 'active', time, time, time).lastInsertRowid);
+    db.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,is_highlight,created_at) VALUES(?,?,36,1,?)').run(taskId, featured, time);
+    assert.equal((await app.inject(`/api/signals?taskId=${taskId}&limit=30`)).json().data.items.some((item: { signalId: number }) => item.signalId === featured), false);
+    assert.equal((await app.inject(`/api/signals?taskId=${taskId}&state=active&ignored=false&highlighted=true&limit=5`)).json().data.items[0].signalId, featured);
+    await app.inject({ method: 'PUT', url: `/api/item-states/signal/${featured}`, payload: { ignored: true } });
+    assert.equal((await app.inject(`/api/signals?taskId=${taskId}&state=active&ignored=false&highlighted=true&limit=5`)).json().data.items.length, 0);
+  } finally { await close(); }
+});
