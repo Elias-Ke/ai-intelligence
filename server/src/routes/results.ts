@@ -82,23 +82,30 @@ export function registerResultRoutes(app: FastifyInstance) {
 
   app.patch('/api/signals/:signalId/state', async (request, reply) => {
     const id = parsePositiveId((request.params as { signalId: string }).signalId); const state = (request.body as { state?: unknown })?.state;
+    if (typeof state !== 'string') throw new BusinessError(ErrorCodes.INVALID_REQUEST, { field: 'state' });
     if (!['active', 'archived'].includes(String(state))) throw new BusinessError(ErrorCodes.INVALID_SIGNAL_STATE);
-    if (!app.db.prepare('SELECT 1 FROM signals WHERE signal_id=?').get(id)) throw new BusinessError(ErrorCodes.SIGNAL_NOT_FOUND);
-    app.db.prepare('UPDATE signals SET state=?,updated_at=? WHERE signal_id=?').run(state, now(), id);
-    return reply.send({ code: 0, message: 'success', data: { signalId: id, state, updatedAt: now() }, requestId: request.id });
+    const previous = app.db.prepare('SELECT state FROM signals WHERE signal_id=?').get(id) as { state: string } | undefined;
+    if (!previous) throw new BusinessError(ErrorCodes.SIGNAL_NOT_FOUND);
+    const updatedAt = now(); app.db.prepare('UPDATE signals SET state=?,updated_at=? WHERE signal_id=?').run(state, updatedAt, id);
+    app.log.info({ event: 'signal.state_changed', requestId: request.id, signalId: id, oldState: previous.state, state, businessCode: 0 }, 'signal state changed');
+    return reply.send({ code: 0, message: 'success', data: { signalId: id, state, updatedAt }, requestId: request.id });
   });
 
   app.put('/api/item-states/:targetType/:targetId', async (request, reply) => {
     const { targetType, targetId } = request.params as { targetType: string; targetId: string }; const id = parsePositiveId(targetId);
     if (!['signal', 'opportunity', 'content_topic'].includes(targetType)) throw new BusinessError(ErrorCodes.INVALID_REQUEST);
-    if (!targetExists(app, targetType, id)) throw new BusinessError(ErrorCodes.ITEM_NOT_FOUND);
     const body = (request.body ?? {}) as Record<string, unknown>;
     if (!['saved', 'ignored', 'valueRating'].some((key) => key in body)) throw new BusinessError(ErrorCodes.EMPTY_ITEM_STATE);
     if ((body.saved !== undefined && typeof body.saved !== 'boolean') || (body.ignored !== undefined && typeof body.ignored !== 'boolean') || (body.valueRating !== undefined && (typeof body.valueRating !== 'number' || ![-1, 0, 1].includes(body.valueRating)))) throw new BusinessError(ErrorCodes.INVALID_REQUEST);
-    const current = app.db.prepare('SELECT saved,ignored,value_rating valueRating FROM item_states WHERE target_type=? AND target_id=?').get(targetType, id) as { saved: number; ignored: number; valueRating: number } | undefined;
-    const saved = body.saved === undefined ? current?.saved ?? 0 : Number(body.saved); const ignored = body.ignored === undefined ? current?.ignored ?? 0 : Number(body.ignored); const valueRating = body.valueRating === undefined ? current?.valueRating ?? 0 : Number(body.valueRating);
-    if (saved && ignored) throw new BusinessError(ErrorCodes.CONTRADICTORY_ITEM_STATE);
-    const updatedAt = now(); app.db.prepare('INSERT INTO item_states(target_type,target_id,saved,ignored,value_rating,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(target_type,target_id) DO UPDATE SET saved=excluded.saved,ignored=excluded.ignored,value_rating=excluded.value_rating,updated_at=excluded.updated_at').run(targetType, id, saved, ignored, valueRating, updatedAt);
+    const { current, saved, ignored, valueRating, updatedAt } = app.db.transaction(() => {
+      if (!targetExists(app, targetType, id)) throw new BusinessError(ErrorCodes.ITEM_NOT_FOUND);
+      const current = app.db.prepare('SELECT saved,ignored,value_rating valueRating FROM item_states WHERE target_type=? AND target_id=?').get(targetType, id) as { saved: number; ignored: number; valueRating: number } | undefined;
+      const saved = body.saved === undefined ? current?.saved ?? 0 : Number(body.saved); const ignored = body.ignored === undefined ? current?.ignored ?? 0 : Number(body.ignored); const valueRating = body.valueRating === undefined ? current?.valueRating ?? 0 : Number(body.valueRating);
+      if (saved && ignored) throw new BusinessError(ErrorCodes.CONTRADICTORY_ITEM_STATE);
+      const updatedAt = now(); app.db.prepare('INSERT INTO item_states(target_type,target_id,saved,ignored,value_rating,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(target_type,target_id) DO UPDATE SET saved=excluded.saved,ignored=excluded.ignored,value_rating=excluded.value_rating,updated_at=excluded.updated_at').run(targetType, id, saved, ignored, valueRating, updatedAt);
+      return { current, saved, ignored, valueRating, updatedAt };
+    })();
+    app.log.info({ event: 'item_state.updated', requestId: request.id, targetType, targetId: id, fields: Object.keys(body), oldValues: current ?? { saved: 0, ignored: 0, valueRating: 0 }, newValues: { saved, ignored, valueRating }, businessCode: 0 }, 'item state updated');
     return reply.send({ code: 0, message: 'success', data: { targetType, targetId: id, saved: Boolean(saved), ignored: Boolean(ignored), valueRating, updatedAt }, requestId: request.id });
   });
 
@@ -123,9 +130,12 @@ export function registerResultRoutes(app: FastifyInstance) {
 
   app.patch('/api/opportunities/:opportunityId/status', async (request, reply) => {
     const id = parsePositiveId((request.params as { opportunityId: string }).opportunityId); const status = (request.body as { status?: unknown })?.status;
+    if (typeof status !== 'string') throw new BusinessError(ErrorCodes.INVALID_REQUEST, { field: 'status' });
     if (!['candidate', 'prepare_verification', 'verified'].includes(String(status))) throw new BusinessError(ErrorCodes.INVALID_OPPORTUNITY_STATUS);
-    if (!app.db.prepare('SELECT 1 FROM opportunities WHERE opportunity_id=?').get(id)) throw new BusinessError(ErrorCodes.OPPORTUNITY_NOT_FOUND);
+    const previous = app.db.prepare('SELECT status FROM opportunities WHERE opportunity_id=?').get(id) as { status: string } | undefined;
+    if (!previous) throw new BusinessError(ErrorCodes.OPPORTUNITY_NOT_FOUND);
     const updatedAt = now(); app.db.prepare('UPDATE opportunities SET status=?,updated_at=? WHERE opportunity_id=?').run(status, updatedAt, id);
+    app.log.info({ event: 'opportunity.status_changed', requestId: request.id, opportunityId: id, oldStatus: previous.status, status, businessCode: 0 }, 'opportunity status changed');
     return reply.send({ code: 0, message: 'success', data: { opportunityId: id, status, updatedAt }, requestId: request.id });
   });
 
@@ -150,9 +160,12 @@ export function registerResultRoutes(app: FastifyInstance) {
 
   app.patch('/api/content-topics/:contentTopicId/status', async (request, reply) => {
     const id = parsePositiveId((request.params as { contentTopicId: string }).contentTopicId); const status = (request.body as { status?: unknown })?.status;
+    if (typeof status !== 'string') throw new BusinessError(ErrorCodes.INVALID_REQUEST, { field: 'status' });
     if (!['candidate', 'preparing', 'published'].includes(String(status))) throw new BusinessError(ErrorCodes.INVALID_TOPIC_STATUS);
-    if (!app.db.prepare('SELECT 1 FROM content_topics WHERE content_topic_id=?').get(id)) throw new BusinessError(ErrorCodes.TOPIC_NOT_FOUND);
+    const previous = app.db.prepare('SELECT status FROM content_topics WHERE content_topic_id=?').get(id) as { status: string } | undefined;
+    if (!previous) throw new BusinessError(ErrorCodes.TOPIC_NOT_FOUND);
     const updatedAt = now(); app.db.prepare('UPDATE content_topics SET status=?,updated_at=? WHERE content_topic_id=?').run(status, updatedAt, id);
+    app.log.info({ event: 'content_topic.status_changed', requestId: request.id, contentTopicId: id, oldStatus: previous.status, status, businessCode: 0 }, 'content topic status changed');
     return reply.send({ code: 0, message: 'success', data: { contentTopicId: id, status, updatedAt }, requestId: request.id });
   });
 
@@ -180,8 +193,11 @@ export function registerResultRoutes(app: FastifyInstance) {
 
   app.put('/api/entities/:entityId/follow', async (request, reply) => {
     const id = parsePositiveId((request.params as { entityId: string }).entityId); const followed = (request.body as { followed?: unknown })?.followed;
-    if (typeof followed !== 'boolean') throw new BusinessError(ErrorCodes.INVALID_REQUEST); if (!app.db.prepare('SELECT 1 FROM entities WHERE entity_id=?').get(id)) throw new BusinessError(ErrorCodes.ENTITY_NOT_FOUND);
+    if (typeof followed !== 'boolean') throw new BusinessError(ErrorCodes.INVALID_REQUEST);
+    const previous = app.db.prepare('SELECT followed FROM entities WHERE entity_id=?').get(id) as { followed: number } | undefined;
+    if (!previous) throw new BusinessError(ErrorCodes.ENTITY_NOT_FOUND);
     const updatedAt = now(); app.db.prepare('UPDATE entities SET followed=?,updated_at=? WHERE entity_id=?').run(followed ? 1 : 0, updatedAt, id);
+    app.log.info({ event: 'entity.follow_changed', requestId: request.id, entityId: id, oldFollowed: Boolean(previous.followed), followed, businessCode: 0 }, 'entity follow changed');
     return reply.send({ code: 0, message: 'success', data: { entityId: id, followed, updatedAt }, requestId: request.id });
   });
 }

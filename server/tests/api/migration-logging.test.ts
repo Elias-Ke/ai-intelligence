@@ -1,0 +1,75 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createApp } from '../../src/app.js';
+import { openDatabase } from '../../src/persistence/database.js';
+
+test('production migration creates the documented indexes and preserves state on repeat', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'intelligence-migration-')); const path = join(directory, 'main.db');
+  try {
+    const db = openDatabase(path);
+    const count = (db.prepare('SELECT count(*) AS count FROM sources').get() as { count: number }).count;
+    db.prepare('UPDATE sources SET enabled=0 WHERE name=?').run('OpenAI');
+    db.close();
+    const reopened = openDatabase(path);
+    try {
+      assert.equal((reopened.prepare('SELECT count(*) AS count FROM sources').get() as { count: number }).count, count);
+      assert.equal((reopened.prepare('SELECT enabled FROM sources WHERE name=?').get('OpenAI') as { enabled: number }).enabled, 0);
+      const indexes = reopened.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
+      for (const name of ['idx_search_runs_task_status', 'idx_raw_discoveries_published', 'idx_raw_discoveries_status_seen', 'idx_scan_discoveries_discovery', 'idx_discovery_search_runs_search_rank', 'idx_signals_type_event', 'idx_scan_signals_highlight', 'idx_signal_sources_relation', 'idx_entities_followed_seen', 'idx_signal_entities_entity', 'idx_entity_events_timeline', 'idx_opportunities_status_score', 'idx_content_topics_status_score', 'idx_item_states_saved']) assert.ok(indexes.some((row) => row.name === name), name);
+      assert.throws(() => reopened.prepare("INSERT INTO item_states(target_type,target_id,saved,ignored,updated_at) VALUES('signal',1,1,1,?)").run(new Date().toISOString()));
+      assert.throws(() => reopened.prepare("INSERT INTO signal_entities(signal_id,entity_id,role) VALUES(999999,999999,'primary')").run());
+      assert.equal(reopened.pragma('foreign_keys', { simple: true }), 1);
+      assert.equal(reopened.pragma('journal_mode', { simple: true }), 'wal');
+    } finally { reopened.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('state changes emit safe correlated events only after successful writes', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'intelligence-logs-')); const db = openDatabase(join(directory, 'main.db'));
+  const app = createApp({ db, logger: false, autoRunScans: false });
+  const events: Record<string, unknown>[] = [];
+  app.log.info = ((record: Record<string, unknown>) => { if (record && typeof record === 'object') events.push(record); }) as typeof app.log.info;
+  await app.ready();
+  try {
+    const now = new Date().toISOString();
+    const signalId = Number(db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,rules_version,state,created_at,updated_at) VALUES('log-signal','Sensitive full text','summary','technology',60,60,60,60,60,60,60,60,'single_source','v1','active',?,?)").run(now, now).lastInsertRowid);
+    const opportunityId = Number(db.prepare("INSERT INTO opportunities(signal_id,opportunity_type,title,summary,body_json,evidence_score,status,schema_version,created_at,updated_at) VALUES(?,'product','opportunity','summary','{}',60,'candidate','v1',?,?)").run(signalId, now, now).lastInsertRowid);
+    const topicId = Number(db.prepare("INSERT INTO content_topics(signal_id,title,core_viewpoint,body_json,platforms_json,evidence_score,status,schema_version,created_at,updated_at) VALUES(?,'topic','point','{}','[]',60,'candidate','v1',?,?)").run(signalId, now, now).lastInsertRowid);
+    const entityId = Number(db.prepare("INSERT INTO entities(entity_type,name,normalized_name,first_seen_at,last_seen_at,created_at,updated_at) VALUES('company','Company','company',?,?,?,?)").run(now, now, now, now).lastInsertRowid);
+    const sourceId = (db.prepare("SELECT source_id AS id FROM sources WHERE name='OpenAI'").get() as { id: number }).id;
+    const requests = [
+      { method: 'PUT', url: `/api/item-states/signal/${signalId}`, payload: { saved: true } },
+      { method: 'PATCH', url: `/api/signals/${signalId}/state`, payload: { state: 'archived' } },
+      { method: 'PATCH', url: `/api/opportunities/${opportunityId}/status`, payload: { status: 'verified' } },
+      { method: 'PATCH', url: `/api/content-topics/${topicId}/status`, payload: { status: 'published' } },
+      { method: 'PUT', url: `/api/entities/${entityId}/follow`, payload: { followed: true } },
+      { method: 'PATCH', url: `/api/sources/${sourceId}`, payload: { enabled: false } }
+    ] as const;
+    for (const request of requests) {
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, 200, request.url);
+      const event = events.find((row) => row.requestId === response.json().requestId && String(row.event).endsWith('_changed') || row.requestId === response.json().requestId && row.event === 'item_state.updated');
+      assert.ok(event, request.url);
+      assert.equal(event.businessCode, 0);
+    }
+    const successful = events.filter((event) => ['item_state.updated', 'signal.state_changed', 'opportunity.status_changed', 'content_topic.status_changed', 'entity.follow_changed', 'source.enabled_changed'].includes(String(event.event)));
+    assert.equal(successful.length, 6);
+    assert.equal((await app.inject({ method: 'PUT', url: `/api/item-states/signal/${signalId}`, payload: { saved: true, ignored: true } })).json().code, 450003);
+    assert.equal(events.filter((event) => event.event === 'item_state.updated').length, 1);
+    for (const url of [`/api/signals/${signalId}/state`, `/api/opportunities/${opportunityId}/status`, `/api/content-topics/${topicId}/status`]) {
+      for (const payload of [{}, { status: 42, state: 42 }]) {
+        const response = await app.inject({ method: 'PATCH', url, payload });
+        assert.equal(response.statusCode, 400); assert.equal(response.json().code, 100001);
+      }
+      const malformed = await app.inject({ method: 'PATCH', url, payload: '{', headers: { 'content-type': 'application/json' } });
+      assert.equal(malformed.statusCode, 400); assert.equal(malformed.json().code, 100001);
+      const wrongType = await app.inject({ method: 'PATCH', url, payload: 'status=done', headers: { 'content-type': 'text/plain' } });
+      assert.equal(wrongType.statusCode, 400); assert.equal(wrongType.json().code, 100001);
+    }
+    const serialized = JSON.stringify(successful);
+    for (const secret of ['Sensitive full text', 'SELECT ', 'Cookie', 'API_KEY', 'prompt']) assert.equal(serialized.includes(secret), false);
+  } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});

@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createServer } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,24 +21,19 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   db.prepare("INSERT INTO signal_sources(signal_id,discovery_id,relation_type,added_at) VALUES(?,?,'primary',?)").run(signalId, discoveryId, time);
   let opportunityCalls = 0;
   let forceInvalid = false;
-  const model = createServer((request, response) => {
-    const chunks: Buffer[] = [];
-    request.on('data', (chunk: Buffer) => chunks.push(chunk));
-    request.on('end', () => {
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { messages: { content: string }[] };
-      const isOpportunity = body.messages[1]?.content.startsWith('cardType:opportunity');
-      const card = body.messages[1]?.content.startsWith('cardType:summary') ? { signalId, summary: '公开案例显示 AI 已进入实际部署，需要进一步核验客户数据', evidenceIds: [discoveryId] } : isOpportunity ? opportunity(forceInvalid || ++opportunityCalls === 1 ? 99999 : discoveryId, signalId) : topic(forceInvalid ? 99999 : discoveryId, signalId);
-      response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(card) } }] }));
-    });
-  });
-  await new Promise<void>((resolve) => model.listen(0, '127.0.0.1', resolve));
-  const address = model.address(); assert.ok(address && typeof address !== 'string');
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    if (!String(input).startsWith('http://model.test/')) return previousFetch(input, init);
+    const body = JSON.parse(String(init?.body)) as { messages: { content: string }[] };
+    const isOpportunity = body.messages[1]?.content.startsWith('cardType:opportunity');
+    const card = body.messages[1]?.content.startsWith('cardType:summary') ? { signalId, summary: '公开案例显示 AI 已进入实际部署，需要进一步核验客户数据', evidenceIds: [discoveryId] } : isOpportunity ? opportunity(forceInvalid || ++opportunityCalls === 1 ? 99999 : discoveryId, signalId) : topic(forceInvalid ? 99999 : discoveryId, signalId);
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(card) } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
   const previous = { base: process.env.LLM_BASE_URL, key: process.env.LLM_API_KEY, model: process.env.LLM_MODEL };
-  process.env.LLM_BASE_URL = `http://127.0.0.1:${address.port}`; process.env.LLM_API_KEY = 'test-key'; process.env.LLM_MODEL = 'test-model';
+  process.env.LLM_BASE_URL = 'http://model.test'; process.env.LLM_API_KEY = 'test-key'; process.env.LLM_MODEL = 'test-model';
   const app = createApp({ db, logger: false, autoRunScans: false });
   t.after(async () => {
-    await app.close(); await new Promise<void>((resolve) => model.close(() => resolve())); db.close(); rmSync(directory, { recursive: true, force: true });
+    await app.close(); globalThis.fetch = previousFetch; db.close(); rmSync(directory, { recursive: true, force: true });
     for (const [key, value] of Object.entries({ LLM_BASE_URL: previous.base, LLM_API_KEY: previous.key, LLM_MODEL: previous.model })) if (value === undefined) delete process.env[key]; else process.env[key] = value;
   });
   const first = await generateCards(app, taskId);

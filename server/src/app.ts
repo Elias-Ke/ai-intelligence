@@ -41,7 +41,8 @@ export function createApp({ db, version = '0.1.0', logger = true, fetchSource = 
     done();
   });
   app.setErrorHandler((error, request, reply) => {
-    const business = error instanceof BusinessError ? error : new BusinessError(ErrorCodes.INTERNAL);
+    const parserError = error instanceof Error && ['FST_ERR_CTP_INVALID_MEDIA_TYPE', 'FST_ERR_CTP_INVALID_JSON_BODY', 'FST_ERR_CTP_EMPTY_JSON_BODY'].includes((error as Error & { code?: string }).code ?? '');
+    const business = error instanceof BusinessError ? error : new BusinessError(parserError ? ErrorCodes.INVALID_REQUEST : ErrorCodes.INTERNAL);
     const decoratedReply = reply as typeof reply & { businessCode?: number };
     decoratedReply.businessCode = business.code;
     if (!(error instanceof BusinessError)) app.log.error({ event: 'api.request.exception', requestId: request.id, businessCode: business.code, errorType: error instanceof Error ? error.name : 'unknown' }, 'unexpected request error');

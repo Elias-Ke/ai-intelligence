@@ -8,8 +8,8 @@ export function openDatabase(path: string): SqliteDatabase {
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('busy_timeout = 5000');
-  db.exec(schemaSql);
-  seedSources(db);
+  try { db.transaction(() => { db.exec(schemaSql); seedSources(db); })(); }
+  catch (error) { db.close(); throw error; }
   return db;
 }
 
