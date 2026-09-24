@@ -28,7 +28,7 @@ export async function generateCards(app: FastifyInstance, taskId: number, deadli
   const signals = app.db.prepare('SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.value_score valueScore,s.monetization_score monetizationScore,s.adoption_score adoptionScore,s.content_value_score contentValueScore,s.evidence_level evidenceLevel,s.has_conflict hasConflict FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id WHERE ss.task_id=? ORDER BY s.value_score DESC,s.signal_id DESC').all(taskId) as Signal[];
   for (const signal of signals) {
     if (Date.now() >= deadline) { counts.failed++; counts.errorCode ??= ErrorCodes.SCAN_TIMEOUT; break; }
-    const evidence = app.db.prepare('SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,d.published_at publishedAt FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=?').all(signal.signalId) as Evidence[];
+    const evidence = app.db.prepare("SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,d.published_at publishedAt FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.status!='extract_failed'").all(signal.signalId) as Evidence[];
     if (!evidence.length) continue;
     const allowed = new Set(evidence.map(({ discoveryId }) => discoveryId));
     const facts = JSON.stringify({ signalId: signal.signalId, title: signal.title, summary: signal.summary, evidence: evidence.map(({ discoveryId, title, url, snippet, publishedAt }) => ({ discoveryId, title, url, snippet: snippet.slice(0, 300), publishedAt })) });

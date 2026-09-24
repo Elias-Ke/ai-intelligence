@@ -80,6 +80,31 @@ test('a wider scan reuses an earlier out-of-range discovery without changing old
   } finally { await app.close(); db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('failed article extraction keeps feed metadata as a reviewable signal without generating cards', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ai-intelligence-extract-'));
+  const db = openDatabase(join(dir, 'test.db'));
+  db.prepare('UPDATE sources SET enabled=0 WHERE source_id!=1').run();
+  db.prepare("UPDATE sources SET kind='rss' WHERE source_id=1").run();
+  const published = new Date(Date.now() - 3_600_000).toUTCString();
+  const app = createApp({ db, logger: false, autoRunScans: false, fetchSource: async (url) => {
+    if (url.endsWith('/ai-case')) throw new Error('article blocked');
+    return { url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>AI Agent launched and deployed in schools</title><link>https://example.org/ai-case</link><description>Customer production workflow</description><pubDate>${published}</pubDate></item></channel></rss>` };
+  } });
+  try {
+    const end = new Date(); const start = new Date(end.getTime() - 86_400_000);
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('extract-failure',?,?,'created',?)").run(start.toISOString(), end.toISOString(), end.toISOString()).lastInsertRowid);
+    await executeScan(app, taskId, start, end);
+    assert.equal((await app.inject(`/api/discoveries?taskId=${taskId}&status=extract_failed`)).json().data.items.length, 1);
+    const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
+    assert.ok(signal);
+    assert.equal(signal.state, 'needs_review');
+    assert.equal(signal.isHighlighted, 0);
+    assert.equal(signal.publishedAtVerified, 1);
+    assert.equal((db.prepare('SELECT count(*) count FROM opportunities').get() as { count: number }).count, 0);
+    assert.equal((db.prepare('SELECT count(*) count FROM content_topics').get() as { count: number }).count, 0);
+  } finally { await app.close(); db.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('scan persists 80 AnySearch runs and connects repeated results to their requests', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ai-intelligence-scan-'));
   const db = openDatabase(join(dir, 'test.db'));
