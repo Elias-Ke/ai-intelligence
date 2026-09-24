@@ -46,6 +46,29 @@ test('same event groups independent evidence, preserves different events and fla
   }
 });
 
+test('failed extraction cannot turn a single complete discovery into a highlighted multi-source signal', async () => {
+  const db = openDatabase(':memory:');
+  const app = createApp({ db, logger: false, autoRunScans: false });
+  const time = '2026-09-23T12:00:00.000Z';
+  try {
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('incomplete-evidence','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run(time).lastInsertRowid);
+    const title = 'AI agent launched and deployed for schools with new research funding';
+    for (const [index, status] of ['accepted', 'extract_failed'].entries()) {
+      const url = `https://independent${index}.example.org/case`;
+      const id = Number(db.prepare('INSERT INTO raw_discoveries(url,normalized_url,title,snippet,published_at,published_at_verified,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,1,?,?,?,?,?)').run(url, url, title, 'Customer production workflow pricing', time, time, `evidence-${index}`, status, time, time).lastInsertRowid);
+      db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,'anysearch',?)").run(taskId, id, time);
+    }
+    analyzeDiscoveries(app, taskId);
+    const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
+    assert.equal(signal.evidenceCount, 2);
+    assert.equal(signal.evidenceLevel, 'single_source');
+    assert.equal(signal.state, 'needs_review');
+    assert.equal(signal.isHighlighted, 0);
+    const details = (await app.inject(`/api/signals/${signal.signalId}`)).json().data;
+    assert.equal(details.scoreExplanation.independentSourceCount, 1);
+  } finally { await app.close(); db.close(); }
+});
+
 test('undated AI discoveries become reviewable signals without pretending the date is verified', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ai-undated-'));
   const db = openDatabase(join(directory, 'test.db'));
