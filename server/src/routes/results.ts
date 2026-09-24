@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { BusinessError, ErrorCodes } from '../domain/errorCodes.js';
 import { now, parseLimit, parsePositiveId } from '../http.js';
+import { paged, readCursor, writeCursor } from './cursor.js';
 
 const bool = (value: unknown, code: number, field: string) => {
   if (value === undefined) return undefined;
@@ -23,13 +24,15 @@ export function registerResultRoutes(app: FastifyInstance) {
     if ((q.status && !statuses.includes(String(q.status))) || (q.channel && !channels.includes(String(q.channel))) || (q.q && String(q.q).length > 200)) throw new BusinessError(ErrorCodes.INVALID_DISCOVERY_FILTER);
     if (q.taskId && !app.db.prepare('SELECT 1 FROM scan_tasks WHERE task_id=?').get(Number(q.taskId))) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
     const clauses: string[] = []; const params: unknown[] = [];
-    if (q.taskId) { clauses.push('sd.task_id=?'); params.push(Number(q.taskId)); }
+    if (q.taskId) { clauses.push('EXISTS (SELECT 1 FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id AND sd.task_id=?)'); params.push(Number(q.taskId)); }
     if (q.status) { clauses.push('d.status=?'); params.push(q.status); }
-    if (q.channel) { clauses.push('sd.discovery_channel=?'); params.push(q.channel); }
+    if (q.channel) { clauses.push(`EXISTS (SELECT 1 FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id AND sd.discovery_channel=? ${q.taskId ? 'AND sd.task_id=?' : ''})`); params.push(q.channel); if (q.taskId) params.push(Number(q.taskId)); }
     if (q.publishedAtVerified !== undefined) { clauses.push('d.published_at_verified=?'); params.push(bool(q.publishedAtVerified, ErrorCodes.INVALID_DISCOVERY_FILTER, 'publishedAtVerified')); }
     if (q.q) { clauses.push('(d.title LIKE ? OR d.url LIKE ?)'); params.push(`%${q.q}%`, `%${q.q}%`); }
-    const rows = app.db.prepare(`SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,s.name sourceName,sd.discovery_channel channel,d.published_at publishedAt,d.published_at_verified publishedAtVerified,d.status,d.rejection_reason rejectionReason,d.first_seen_at firstSeenAt,d.last_seen_at lastSeenAt FROM raw_discoveries d LEFT JOIN sources s ON s.source_id=d.source_id LEFT JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY d.last_seen_at DESC LIMIT ?`).all(...params, limit);
-    return reply.send({ code: 0, message: 'success', data: page(rows), requestId: request.id });
+    const cursor = readCursor('discoveries', q, 2);
+    if (cursor) { clauses.push('(d.last_seen_at,d.discovery_id) < (?,?)'); params.push(...cursor); }
+    const rows = app.db.prepare(`SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,s.name sourceName,(SELECT sd.discovery_channel FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id ${q.taskId ? 'AND sd.task_id=?' : ''} ORDER BY sd.task_id DESC LIMIT 1) channel,d.published_at publishedAt,d.published_at_verified publishedAtVerified,d.status,d.rejection_reason rejectionReason,d.first_seen_at firstSeenAt,d.last_seen_at lastSeenAt FROM raw_discoveries d LEFT JOIN sources s ON s.source_id=d.source_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY d.last_seen_at DESC,d.discovery_id DESC LIMIT ?`).all(...(q.taskId ? [Number(q.taskId)] : []), ...params, limit + 1) as { discoveryId: number; lastSeenAt: string }[];
+    return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('discoveries', q, [row.lastSeenAt, row.discoveryId])), requestId: request.id });
   });
 
   app.get('/api/signals', async (request, reply) => {
@@ -39,18 +42,22 @@ export function registerResultRoutes(app: FastifyInstance) {
     if (q.q && (String(q.q).length > 200 || /["'();]/.test(String(q.q)))) throw new BusinessError(ErrorCodes.INVALID_FTS_QUERY);
     if (q.taskId && !app.db.prepare('SELECT 1 FROM scan_tasks WHERE task_id=?').get(Number(q.taskId))) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
     const clauses: string[] = []; const params: unknown[] = [];
-    if (q.taskId) { clauses.push('ss.task_id=?'); params.push(Number(q.taskId)); }
+    if (q.taskId) { clauses.push('EXISTS(SELECT 1 FROM scan_signals ss WHERE ss.signal_id=s.signal_id AND ss.task_id=?)'); params.push(Number(q.taskId)); }
     if (q.signalType) { clauses.push('s.signal_type=?'); params.push(q.signalType); }
     if (q.evidenceLevel) { clauses.push('s.evidence_level=?'); params.push(q.evidenceLevel); }
     if (q.state) { clauses.push('s.state=?'); params.push(q.state); }
     if (q.entityId) { clauses.push('EXISTS(SELECT 1 FROM signal_entities se WHERE se.signal_id=s.signal_id AND se.entity_id=?)'); params.push(Number(q.entityId)); }
     if (q.saved !== undefined) { clauses.push('COALESCE(i.saved,0)=?'); params.push(bool(q.saved, ErrorCodes.INVALID_SIGNAL_FILTER, 'saved')); }
     if (q.ignored !== undefined) { clauses.push('COALESCE(i.ignored,0)=?'); params.push(bool(q.ignored, ErrorCodes.INVALID_SIGNAL_FILTER, 'ignored')); }
-    if (q.highlighted !== undefined) { if (!q.taskId) throw new BusinessError(ErrorCodes.INVALID_SIGNAL_FILTER); clauses.push('ss.is_highlight=?'); params.push(bool(q.highlighted, ErrorCodes.INVALID_SIGNAL_FILTER, 'highlighted')); }
+    if (q.highlighted !== undefined) { if (!q.taskId) throw new BusinessError(ErrorCodes.INVALID_SIGNAL_FILTER); clauses.push('EXISTS(SELECT 1 FROM scan_signals ss WHERE ss.signal_id=s.signal_id AND ss.task_id=? AND ss.is_highlight=?)'); params.push(Number(q.taskId), bool(q.highlighted, ErrorCodes.INVALID_SIGNAL_FILTER, 'highlighted')); }
     if (q.q) { clauses.push('(s.title LIKE ? OR s.summary LIKE ? OR s.search_text LIKE ?)'); params.push(`%${q.q}%`, `%${q.q}%`, `%${q.q}%`); }
-    const order = q.sort === 'newest' ? 's.event_at DESC' : q.sort === 'evidence' ? 's.truth_score DESC, s.value_score DESC' : 's.value_score DESC, s.event_at DESC';
-    const rows = (app.db.prepare(`SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.tags_text tagsText,s.novelty_score noveltyScore,s.truth_score truthScore,s.technology_score technologyScore,s.adoption_score adoptionScore,s.monetization_score monetizationScore,s.content_value_score contentValueScore,s.value_score valueScore,s.evidence_level evidenceLevel,(SELECT count(*) FROM signal_sources sx WHERE sx.signal_id=s.signal_id) evidenceCount,s.has_conflict hasConflict,s.state,s.event_at eventAt,COALESCE(ss.is_highlight,0) isHighlighted,COALESCE(i.saved,0) saved,COALESCE(i.ignored,0) ignored,s.created_at createdAt FROM signals s LEFT JOIN scan_signals ss ON ss.signal_id=s.signal_id LEFT JOIN item_states i ON i.target_type='signal' AND i.target_id=s.signal_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${order},s.signal_id LIMIT ?`).all(...params, limit) as Record<string, unknown>[]).map((row) => ({ ...row, tags: String(row.tagsText || '').split(',').filter(Boolean) }));
-    return reply.send({ code: 0, message: 'success', data: page(rows), requestId: request.id });
+    const sort = q.sort === 'newest' ? 'newest' : q.sort === 'evidence' ? 'evidence' : 'value';
+    const keys = sort === 'newest' ? ['COALESCE(s.event_at,\'\')', 's.signal_id'] : sort === 'evidence' ? ['s.truth_score', 's.value_score', 's.signal_id'] : ['s.value_score', "COALESCE(s.event_at,'')", 's.signal_id'];
+    const cursor = readCursor('signals', q, keys.length);
+    if (cursor) { clauses.push(`(${keys.join(',')}) < (${keys.map(() => '?').join(',')})`); params.push(...cursor); }
+    const rows = (app.db.prepare(`SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.tags_text tagsText,s.novelty_score noveltyScore,s.truth_score truthScore,s.technology_score technologyScore,s.adoption_score adoptionScore,s.monetization_score monetizationScore,s.content_value_score contentValueScore,s.value_score valueScore,s.evidence_level evidenceLevel,(SELECT count(*) FROM signal_sources sx WHERE sx.signal_id=s.signal_id) evidenceCount,s.has_conflict hasConflict,s.state,s.event_at eventAt,COALESCE((SELECT ss.is_highlight FROM scan_signals ss WHERE ss.signal_id=s.signal_id ${q.taskId ? 'AND ss.task_id=?' : ''} ORDER BY ss.task_id DESC LIMIT 1),0) isHighlighted,COALESCE(i.saved,0) saved,COALESCE(i.ignored,0) ignored,s.created_at createdAt FROM signals s LEFT JOIN item_states i ON i.target_type='signal' AND i.target_id=s.signal_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${keys.map((key) => `${key} DESC`).join(',')} LIMIT ?`).all(...(q.taskId ? [Number(q.taskId)] : []), ...params, limit + 1) as Record<string, unknown>[]).map((row) => ({ ...row, tags: String(row.tagsText || '').split(',').filter(Boolean) }));
+    const position = (row: Record<string, unknown>) => sort === 'newest' ? [String(row.eventAt ?? ''), Number(row.signalId)] : sort === 'evidence' ? [Number(row.truthScore), Number(row.valueScore), Number(row.signalId)] : [Number(row.valueScore), String(row.eventAt ?? ''), Number(row.signalId)];
+    return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('signals', q, position(row))), requestId: request.id });
   });
 
   app.get('/api/signals/:signalId', async (request, reply) => {

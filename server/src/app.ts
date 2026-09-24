@@ -30,7 +30,7 @@ export function createApp({ db, version = '0.1.0', logger = true, fetchSource = 
   });
   app.addHook('preValidation', async (request) => {
     const cursor = (request.query as Record<string, unknown> | undefined)?.cursor;
-    if (cursor !== undefined && (typeof cursor !== 'string' || !/^c_[A-Za-z0-9_-]{6,200}$/.test(cursor))) throw new BusinessError(ErrorCodes.INVALID_CURSOR);
+    if (cursor !== undefined && (typeof cursor !== 'string' || !/^c_[A-Za-z0-9_-]{6,200}\.[A-Za-z0-9_-]{22}$/.test(cursor))) throw new BusinessError(ErrorCodes.INVALID_CURSOR);
   });
 
   app.addHook('onResponse', (request, reply, done) => {
