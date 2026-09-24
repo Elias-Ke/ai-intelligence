@@ -17,7 +17,7 @@ test('scan extracts missing search bodies with three workers and retains metadat
     assert.equal(init?.headers && (init.headers as Record<string, string>).authorization, 'Bearer secret');
     if (String(input).endsWith('/v1/search')) {
       const index = ++searchCalls;
-      const results = index === 1 ? [1, 2, 3, 4, 5].map((number) => ({ title: `Result ${number}`, url: `https://example.org/${number}`, snippet: `Snippet ${number}`, published_at: '2026-09-23T12:00:00.000Z' })) : [];
+      const results = index === 1 ? [1, 2, 3, 4, 5].map((number) => ({ title: `AI Result ${number}`, url: `https://example.org/${number}`, snippet: `Snippet ${number}`, published_at: '2026-09-23T12:00:00.000Z' })) : [];
       return Response.json({ code: 0, request_id: `search-${index}`, data: { results } });
     }
     assert.ok(String(input).endsWith('/v1/extract'));
