@@ -12,11 +12,15 @@ test('production migration creates the documented indexes and preserves state on
     const db = openDatabase(path);
     const count = (db.prepare('SELECT count(*) AS count FROM sources').get() as { count: number }).count;
     db.prepare('UPDATE sources SET enabled=0 WHERE name=?').run('OpenAI');
+    db.prepare("UPDATE sources SET url='https://arxiv.org/list/cs.AI/recent',kind='web',enabled=0 WHERE name='arXiv cs.AI'").run();
+    db.prepare("UPDATE sources SET url='https://github.com/search?q=AI&type=repositories',kind='web' WHERE name='GitHub Search'").run();
     db.close();
     const reopened = openDatabase(path);
     try {
       assert.equal((reopened.prepare('SELECT count(*) AS count FROM sources').get() as { count: number }).count, count);
       assert.equal((reopened.prepare('SELECT enabled FROM sources WHERE name=?').get('OpenAI') as { enabled: number }).enabled, 0);
+      assert.deepEqual(reopened.prepare("SELECT kind,url,enabled FROM sources WHERE name='arXiv cs.AI'").get(), { kind: 'rss', url: 'https://rss.arxiv.org/rss/cs.AI', enabled: 0 });
+      assert.deepEqual(reopened.prepare("SELECT kind,url FROM sources WHERE name='GitHub Search'").get(), { kind: 'api', url: 'https://api.github.com/search/repositories?q=ai+agent&sort=updated&order=desc&per_page=40' });
       const indexes = reopened.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
       for (const name of ['idx_search_runs_task_status', 'idx_raw_discoveries_published', 'idx_raw_discoveries_status_seen', 'idx_scan_discoveries_discovery', 'idx_discovery_search_runs_search_rank', 'idx_signals_type_event', 'idx_scan_signals_highlight', 'idx_signal_sources_relation', 'idx_entities_followed_seen', 'idx_signal_entities_entity', 'idx_entity_events_timeline', 'idx_opportunities_status_score', 'idx_content_topics_status_score', 'idx_item_states_saved']) assert.ok(indexes.some((row) => row.name === name), name);
       assert.throws(() => reopened.prepare("INSERT INTO item_states(target_type,target_id,saved,ignored,updated_at) VALUES('signal',1,1,1,?)").run(new Date().toISOString()));

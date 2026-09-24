@@ -1,6 +1,6 @@
 const weights = { novelty: 15, truth: 20, technology: 15, adoption: 20, monetization: 15, contentValue: 15 } as const;
 
-export function scoreDiscovery(discovery: { title: string; snippet: string; trustLevel?: number | null; publishedAt?: string | null }) {
+export function scoreDiscovery(discovery: { title: string; snippet: string; trustLevel?: number | null; publishedAt?: string | null; sourceName?: string | null }) {
   const text = `${discovery.title} ${discovery.snippet}`;
   const has = (pattern: RegExp) => pattern.test(text);
   const relevant = has(/\b(?:ai|llm|gpt|agent|inference|claude|gemini|deepseek|qwen|copilot|model|models|machine learning|automation)\b|人工智能|大模型|生成式|智能体|机器学习|深度学习|模型|推理|自动化/i);
@@ -18,7 +18,8 @@ export function scoreDiscovery(discovery: { title: string; snippet: string; trus
     monetization: 50 + Number(commercial) * 20,
     contentValue: 50 + Number(deployment || research) * 15
   };
-  const relevance = relevant ? 65 : 20;
+  const curatedResearch = /^(?:arXiv cs\.(?:AI|CL|LG|CV)|HF Papers)$/.test(discovery.sourceName ?? '');
+  const relevance = relevant ? 65 : curatedResearch ? 40 : 20;
   const value = Math.round(Object.entries(weights).reduce((sum, [key, weight]) => sum + scores[key as keyof typeof scores] * weight, 0) / 100);
   const type = has(/融资|并购|funding|acquisition/i) ? 'funding' : research ? 'paper' : deployment ? 'use_case' : has(/开源|open.source/i) ? 'open_source' : release ? 'product' : 'market';
   const matched = [release && 'release', research && 'research', deployment && 'deployment', commercial && 'commercial', verified && 'dated', trust >= 5 && 'official_source'].filter(Boolean);

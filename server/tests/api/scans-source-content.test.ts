@@ -47,3 +47,20 @@ test('scan deadline stops new article requests and retains completed source meta
     assert.deepEqual(task, { status: 'failed', errorCode: 200010 });
   } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('RSS collection accepts larger official feeds without lifting article response limits', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-feed-budget-'));
+  const db = openDatabase(join(directory, 'test.db'));
+  db.prepare("UPDATE sources SET enabled=(name='arXiv cs.AI')").run();
+  const limits: number[] = [];
+  const app = createApp({ db, logger: false, autoRunScans: false, fetchSource: async (url, options) => {
+    limits.push(options?.maxBytes ?? 0);
+    return url.includes('/rss/') ? { url, contentType: 'application/rss+xml', text: '<rss><channel><item><title>AI Agent deployed in schools</title><link>https://example.org/ai-case</link><pubDate>Wed, 23 Sep 2026 12:00:00 GMT</pubDate></item></channel></rss>' } : { url, contentType: 'text/html', text: '<article>AI deployment details</article>' };
+  } });
+  try {
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('feed-budget','2026-09-23T00:00:00Z','2026-09-24T00:00:00Z','created',?)").run(new Date().toISOString()).lastInsertRowid);
+    await executeScan(app, taskId, new Date('2026-09-23T00:00:00Z'), new Date('2026-09-24T00:00:00Z'));
+    assert.deepEqual(limits, [2_000_000, 0]);
+    assert.equal((db.prepare('SELECT count(*) count FROM raw_discoveries').get() as { count: number }).count, 1);
+  } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});

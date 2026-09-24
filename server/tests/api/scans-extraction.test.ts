@@ -29,7 +29,7 @@ test('scan extracts missing search bodies with three workers and retains metadat
     if (body.url.endsWith('/5')) return Response.json({ code: 422, message: 'unavailable' }, { status: 422 });
     return Response.json({ code: 0, request_id: 'extract-request', data: { url: body.url, content: 'x'.repeat(60_000) } });
   }) as typeof fetch);
-  const app = createApp({ db, logger: false, searchClient: client, fetchSource: async (url) => ({ url, text: '', contentType: 'text/html' }) });
+  const app = createApp({ db, logger: false, searchClient: client, fetchSource: async (url) => url.includes('api.github.com') ? { url, text: '{"items":[]}', contentType: 'application/json' } : { url, text: '', contentType: 'text/html' } });
   try {
     const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('extraction-test','2026-09-23T00:00:00.000Z','2026-09-24T00:00:00.000Z','created',?)").run(new Date().toISOString()).lastInsertRowid);
     await runScan(app, taskId);

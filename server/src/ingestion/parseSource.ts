@@ -27,7 +27,7 @@ export function parseSource(body: string, base: string, kind: 'rss' | 'api' | 'w
     entries = rows.slice(0, 100).map((row) => {
       if (!row || typeof row !== 'object') return null;
       const record = row as Record<string, unknown>;
-      return item(base, String(record.url ?? record.link ?? ''), String(record.title ?? ''), String(record.summary ?? record.description ?? ''), String(record.publishedAt ?? record.published_at ?? ''));
+      return item(base, String(record.html_url ?? record.url ?? record.link ?? ''), String(record.title ?? record.full_name ?? ''), String(record.summary ?? record.description ?? ''), String(record.publishedAt ?? record.published_at ?? ''));
     });
   } else if (kind === 'rss' || /xml|rss|atom/.test(contentType)) {
     const $ = cheerio.load(body, { xml: true });
@@ -37,11 +37,12 @@ export function parseSource(body: string, base: string, kind: 'rss' | 'api' | 'w
     }).get();
   } else {
     const $ = cheerio.load(body);
-    entries = $('article a[href], main h2 a[href], main h3 a[href]').slice(0, 100).map((_index, anchor) => {
+    const anchors = $('article a[href], main h2 a[href], main h3 a[href]');
+    entries = (anchors.length ? anchors : $('main a[href], [role=main] a[href], dl dt a[href]')).slice(0, 100).map((_index, anchor) => {
       const link = $(anchor);
       const container = link.closest('article');
       return item(base, link.attr('href') ?? '', link.text(), container.find('p').first().text(), container.find('time[datetime]').first().attr('datetime') ?? container.find('time').first().text());
     }).get();
   }
-  return [...new Map(entries.filter((entry): entry is SourceItem => entry !== null).map((entry) => [entry.url, entry])).values()].slice(0, 40);
+  return [...new Map(entries.filter((entry): entry is SourceItem => entry !== null).map((entry) => [entry.url, entry])).values()].slice(0, kind === 'rss' ? 100 : 40);
 }

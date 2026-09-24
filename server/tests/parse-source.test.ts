@@ -14,3 +14,15 @@ test('HTML uses article anchors and does not infer publication time from fetch t
   assert.equal(entries[0].url, 'https://example.org/news/new-ai-agent');
   assert.equal(entries[0].publishedAt, null);
 });
+
+test('repository search uses the public HTML link instead of the API resource', () => {
+  const entries = parseSource(JSON.stringify({ items: [{ full_name: 'example/ai-agents', html_url: 'https://github.com/example/ai-agents', url: 'https://api.github.com/repos/example/ai-agents', description: 'Open-source AI agent', updated_at: '2026-09-23T12:00:00Z' }] }), 'https://api.github.com/search/repositories?q=ai', 'api', 'application/json');
+  assert.equal(entries[0].url, 'https://github.com/example/ai-agents');
+  assert.equal(entries[0].title, 'example/ai-agents');
+  assert.equal(entries[0].publishedAt, null);
+});
+
+test('HTML listing without article elements still yields article links', () => {
+  const entries = parseSource('<main><ul><li><a href="/research/ai-agents">AI agents in practice</a></li></ul></main>', 'https://example.org/research', 'web', 'text/html');
+  assert.deepEqual(entries.map((entry) => entry.url), ['https://example.org/research/ai-agents']);
+});

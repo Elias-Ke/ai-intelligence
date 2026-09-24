@@ -8,6 +8,8 @@ test('relevance keeps unrelated records out of analyzed signals', () => {
   assert.equal(result.evidenceLevel, 'single_source');
   assert.ok(scoreDiscovery({ title: 'Autumn music event', snippet: 'A regional concert', trustLevel: 5 }).relevance < 35);
   assert.ok(scoreDiscovery({ title: 'Introducing Claude for Teams', snippet: 'New release', trustLevel: 5 }).relevance >= 35);
+  assert.ok(scoreDiscovery({ title: 'A new approach to alignment', snippet: 'Experimental results', sourceName: 'arXiv cs.AI', trustLevel: 4 }).relevance >= 35);
+  assert.ok(scoreDiscovery({ title: 'A regional concert', snippet: 'Tickets on sale', sourceName: 'OpenAI', trustLevel: 5 }).relevance < 35);
 });
 
 test('official dated deployment earns explainable six-dimensional score', () => {

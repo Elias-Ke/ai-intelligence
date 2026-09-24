@@ -3,16 +3,16 @@ import type { FastifyInstance } from 'fastify';
 import { scoreDiscovery } from './scoring.js';
 import { contradicts, eventSimilarity, eventTokens } from './clustering.js';
 
-type Discovery = { discovery_id: number; title: string; snippet: string; url: string; normalized_url: string; content_hash: string; published_at: string | null; fetched_at: string; trustLevel: number | null };
+type Discovery = { discovery_id: number; title: string; snippet: string; url: string; normalized_url: string; content_hash: string; published_at: string | null; fetched_at: string; trustLevel: number | null; sourceName: string | null };
 type Candidate = { signalId: number; title: string; eventAt: string | null };
 
 export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
-  const discoveries = app.db.prepare("SELECT d.*,src.trust_level trustLevel FROM raw_discoveries d JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE sd.task_id=? AND (d.status='accepted' OR (d.status='candidate' AND d.published_at IS NULL)) ORDER BY d.discovery_id").all(taskId) as Discovery[];
+  const discoveries = app.db.prepare("SELECT d.*,src.trust_level trustLevel,src.name sourceName FROM raw_discoveries d JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE sd.task_id=? AND (d.status='accepted' OR (d.status='candidate' AND d.published_at IS NULL)) ORDER BY d.discovery_id").all(taskId) as Discovery[];
   const save = app.db.transaction((discovery: Discovery, rank: number) => {
     const timestamp = new Date().toISOString();
     const title = discovery.title || discovery.url;
     const summary = discovery.snippet.slice(0, 500);
-    const assessment = scoreDiscovery({ title, snippet: summary, trustLevel: discovery.trustLevel, publishedAt: discovery.published_at });
+    const assessment = scoreDiscovery({ title, snippet: summary, trustLevel: discovery.trustLevel, publishedAt: discovery.published_at, sourceName: discovery.sourceName });
     if (assessment.relevance < 35) return false;
 
     const tokens = [...eventTokens(title)].filter((token) => /[a-z0-9]/.test(token)).slice(0, 4);

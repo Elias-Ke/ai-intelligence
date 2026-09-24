@@ -33,11 +33,11 @@ function seedSources(db: SqliteDatabase) {
     ['月之暗面', '国内官方', 'web', 'https://www.moonshot.cn/', 'zh-CN', 'cn', 5],
     ['DeepSeek', '国内官方', 'web', 'https://www.deepseek.com/', 'zh-CN', 'cn', 5],
     ['MiniMax', '国内官方', 'web', 'https://www.minimaxi.com/news', 'zh-CN', 'cn', 5],
-    ['arXiv cs.AI', '研究开源', 'web', 'https://arxiv.org/list/cs.AI/recent', 'en', 'global', 4],
-    ['arXiv cs.CL', '研究开源', 'web', 'https://arxiv.org/list/cs.CL/recent', 'en', 'global', 4],
-    ['arXiv cs.LG', '研究开源', 'web', 'https://arxiv.org/list/cs.LG/recent', 'en', 'global', 4],
-    ['arXiv cs.CV', '研究开源', 'web', 'https://arxiv.org/list/cs.CV/recent', 'en', 'global', 4],
-    ['GitHub Search', '研究开源', 'web', 'https://github.com/search?q=AI&type=repositories', 'en', 'global', 4],
+    ['arXiv cs.AI', '研究开源', 'rss', 'https://rss.arxiv.org/rss/cs.AI', 'en', 'global', 4],
+    ['arXiv cs.CL', '研究开源', 'rss', 'https://rss.arxiv.org/rss/cs.CL', 'en', 'global', 4],
+    ['arXiv cs.LG', '研究开源', 'rss', 'https://rss.arxiv.org/rss/cs.LG', 'en', 'global', 4],
+    ['arXiv cs.CV', '研究开源', 'rss', 'https://rss.arxiv.org/rss/cs.CV', 'en', 'global', 4],
+    ['GitHub Search', '研究开源', 'api', 'https://api.github.com/search/repositories?q=ai+agent&sort=updated&order=desc&per_page=40', 'en', 'global', 4],
     ['机器之心', '科技媒体', 'web', 'https://www.jiqizhixin.com/', 'zh-CN', 'cn', 3],
     ['量子位', '科技媒体', 'web', 'https://www.qbitai.com/', 'zh-CN', 'cn', 3],
     ['36氪 AI', '科技媒体', 'web', 'https://36kr.com/information/AI', 'zh-CN', 'cn', 3],
@@ -48,6 +48,13 @@ function seedSources(db: SqliteDatabase) {
   ] as const;
   const insert = db.prepare('INSERT OR IGNORE INTO sources(name,source_group,kind,url,language,region,trust_level,enabled,fetch_interval_minutes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,1440,?,?)');
   const timestamp = new Date().toISOString();
-  const transaction = db.transaction(() => { for (const source of sources) insert.run(...source, timestamp, timestamp); });
+  const upgrade = db.prepare("UPDATE sources SET kind=?,url=?,updated_at=? WHERE name=? AND url=? AND kind='web' AND NOT EXISTS(SELECT 1 FROM sources WHERE url=?)");
+  const transaction = db.transaction(() => {
+    for (const source of sources) {
+      const legacyUrl = source[0].startsWith('arXiv cs.') ? `https://arxiv.org/list/${source[0].slice(6)}/recent` : source[0] === 'GitHub Search' ? 'https://github.com/search?q=AI&type=repositories' : null;
+      if (legacyUrl) upgrade.run(source[2], source[3], timestamp, source[0], legacyUrl, source[3]);
+      insert.run(...source, timestamp, timestamp);
+    }
+  });
   transaction();
 }

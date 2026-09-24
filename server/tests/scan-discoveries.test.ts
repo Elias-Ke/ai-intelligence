@@ -8,7 +8,7 @@ import { openDatabase } from '../src/persistence/database.js';
 import { executeScan } from '../src/routes/scans.js';
 import { AnySearchClient } from '../src/ingestion/AnySearchClient.js';
 
-test('scan keeps undated articles as raw discoveries without inventing cards', async () => {
+test('scan keeps undated articles as reviewable signals without inventing cards', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ai-intelligence-scan-'));
   const db = openDatabase(join(dir, 'test.db'));
   db.prepare('UPDATE sources SET enabled=0 WHERE source_id!=1').run();
@@ -22,7 +22,10 @@ test('scan keeps undated articles as raw discoveries without inventing cards', a
     const raw = db.prepare('SELECT url,status,published_at_verified verified FROM raw_discoveries').get() as { url: string; status: string; verified: number };
     assert.match(raw.url, /\/news\/agent-case$/);
     assert.equal(raw.status, 'candidate'); assert.equal(raw.verified, 0);
-    for (const table of ['signals', 'opportunities', 'content_topics']) assert.equal((db.prepare(`SELECT count(*) count FROM ${table}`).get() as { count: number }).count, 0);
+    const signal = db.prepare('SELECT state FROM signals').get() as { state: string };
+    assert.equal(signal.state, 'needs_review');
+    assert.equal((db.prepare('SELECT is_highlight highlighted FROM scan_signals WHERE task_id=?').get(taskId) as { highlighted: number }).highlighted, 0);
+    for (const table of ['opportunities', 'content_topics']) assert.equal((db.prepare(`SELECT count(*) count FROM ${table}`).get() as { count: number }).count, 0);
   } finally { await app.close(); db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
