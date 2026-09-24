@@ -7,6 +7,7 @@ import { publicUrl } from '../ingestion/publicHttp.js';
 import { buildSearchQueries, QUERY_VERSION } from '../ingestion/searchQueries.js';
 import { analyzeDiscoveries } from '../domain/analyzeDiscoveries.js';
 import { updateTrends } from '../domain/trends.js';
+import { extractArticle } from '../ingestion/extractArticle.js';
 import { generateCards } from '../generation/cards.js';
 
 const activeStatuses = ['created', 'collecting', 'normalizing', 'clustering', 'analyzing', 'generating', 'retrying'];
@@ -24,7 +25,8 @@ function rangeWindow(body: Record<string, unknown>) {
 
 function taskView(row: Record<string, unknown>) { return { taskId: row.task_id, status: row.status, currentStep: row.current_step, progress: row.progress, discoveredCount: row.discovered_count, signalCount: row.signal_count, opportunityCount: row.opportunity_count, contentTopicCount: row.content_topic_count, rangeFrom: row.range_from, rangeTo: row.range_to, errorCode: row.error_code, errorMessage: row.error_message, createdAt: row.created_at, startedAt: row.started_at, finishedAt: row.finished_at }; }
 
-export async function executeScan(app: FastifyInstance, taskId: number, rangeFrom: Date, rangeTo: Date) {
+export async function executeScan(app: FastifyInstance, taskId: number, rangeFrom: Date, rangeTo: Date, maxDurationMs = 30 * 60_000) {
+  const deadline = Date.now() + maxDurationMs;
   const startedAt = now();
   app.db.prepare("UPDATE scan_tasks SET status='collecting',current_step='collecting',started_at=?,heartbeat_at=? WHERE task_id=?").run(startedAt, startedAt, taskId);
   app.taskEvents.emit('changed', taskId);
@@ -43,13 +45,33 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     return { discoveryId: row.discoveryId, isNew: !linked };
   });
   const queue = [...sources];
-  const worker = async () => { while (queue.length && discovered < 2000) { const source = queue.shift(); if (!source) return; try { const response = await app.fetchSource(source.url); const items = parseSource(response.text, response.url, source.kind, response.contentType); for (const item of items) { if (discovered >= 2000) break; if (saveDiscovery(source.sourceId, item.url, item.title, item.snippet, 'source', item.publishedAt).isNew) discovered += 1; } app.log.info({ event: 'source.fetch.completed', taskId, sourceId: source.sourceId, resultCount: items.length }, 'source fetch completed'); } catch (error) { failed += 1; scanErrorCode ??= error instanceof BusinessError ? error.code : ErrorCodes.SOURCE_UNREACHABLE; app.log.warn({ event: 'source.fetch.failed', taskId, sourceId: source.sourceId, businessCode: error instanceof BusinessError ? error.code : ErrorCodes.SOURCE_UNREACHABLE }, 'source fetch failed'); } } };
+  const articleQueue: { sourceId: number; url: string; title: string; snippet: string; publishedAt: string | null }[] = [];
+  const timedOut = () => Date.now() >= deadline;
+  const worker = async () => { while (queue.length && discovered + articleQueue.length < 2000 && !timedOut()) { const source = queue.shift(); if (!source) return; try { const response = await app.fetchSource(source.url); const items = parseSource(response.text, response.url, source.kind, response.contentType); for (const item of items) { if (discovered + articleQueue.length >= 2000) break; articleQueue.push({ ...item, sourceId: source.sourceId }); } app.db.prepare('UPDATE sources SET last_checked_at=?,last_success_at=?,last_error_code=NULL WHERE source_id=?').run(now(), now(), source.sourceId); app.log.info({ event: 'source.fetch.completed', taskId, sourceId: source.sourceId, resultCount: items.length }, 'source fetch completed'); } catch (error) { const code = error instanceof BusinessError ? error.code : ErrorCodes.SOURCE_UNREACHABLE; app.db.prepare('UPDATE sources SET last_checked_at=?,last_error_code=? WHERE source_id=?').run(now(), code, source.sourceId); failed += 1; scanErrorCode ??= code; app.log.warn({ event: 'source.fetch.failed', taskId, sourceId: source.sourceId, businessCode: code }, 'source fetch failed'); } } };
   await Promise.all(Array.from({ length: Math.min(8, sources.length) }, () => worker()));
+  const articleWorker = async () => { while (articleQueue.length && discovered < 2000 && !timedOut()) {
+    const item = articleQueue.shift(); if (!item) return;
+    let content = item.snippet; let publishedAt = item.publishedAt; let extractionFailed = false;
+    try {
+      const page = await app.fetchSource(item.url);
+      const article = extractArticle(page.text, page.contentType);
+      content = article.content || content;
+      publishedAt ??= article.publishedAt;
+    } catch (error) {
+      extractionFailed = true; failed++; scanErrorCode ??= ErrorCodes.EXTRACTION_FAILED;
+      app.db.prepare('UPDATE sources SET last_error_code=? WHERE source_id=?').run(ErrorCodes.EXTRACTION_FAILED, item.sourceId);
+      app.log.warn({ event: 'source.article.failed', taskId, sourceId: item.sourceId, businessCode: ErrorCodes.EXTRACTION_FAILED, errorType: error instanceof Error ? error.name : 'unknown' }, 'article unavailable, metadata retained');
+    }
+    if (saveDiscovery(item.sourceId, item.url, item.title, content, 'source', publishedAt, extractionFailed).isNew) discovered++;
+  } };
+  await Promise.all(Array.from({ length: 3 }, () => articleWorker()));
+  let pendingSearch = 0;
   if (app.searchClient) {
     const searchQueue = buildSearchQueries();
+    const knownHosts = new Set((app.db.prepare('SELECT url FROM sources').all() as { url: string }[]).map(({ url }) => new URL(url).hostname));
     const extractionQueue: { url: string; title: string; snippet: string; publishedAt: string | null; searchRunId: number; rank: number }[] = [];
     let quotaExhausted = false;
-    const searchWorker = async () => { while (searchQueue.length && discovered < 2000 && !quotaExhausted) {
+    const searchWorker = async () => { while (searchQueue.length && discovered + extractionQueue.length < 2000 && !quotaExhausted && !timedOut()) {
       const query = searchQueue.shift(); if (!query) return;
       const started = Date.now();
       const searchRun = app.db.prepare("INSERT INTO search_runs(task_id,query_key,query_version,query_text,zone,language,status,started_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(task_id,query_key,zone,language) DO UPDATE SET status='running',error_code=NULL,started_at=excluded.started_at RETURNING search_run_id searchRunId").get(taskId, query.queryKey, QUERY_VERSION, query.queryText, query.zone, query.language, 'running', now()) as { searchRunId: number };
@@ -59,6 +81,14 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
           if (discovered >= 2000) break;
           try {
             const url = publicUrl(result.url).toString();
+            const origin = new URL(url).origin;
+            const host = new URL(url).hostname;
+            if (!knownHosts.has(host)) {
+              const timestamp = now();
+              app.db.prepare("INSERT OR IGNORE INTO sources(name,source_group,kind,url,language,region,trust_level,enabled,fetch_interval_minutes,created_at,updated_at) VALUES(?,'新发现候选','web',?,?,?,1,0,1440,?,?)").run(host, origin, query.language, query.zone, timestamp, timestamp);
+              knownHosts.add(host);
+              app.log.info({ event: 'source.candidate.discovered', taskId, host, businessCode: 0 }, 'new source candidate saved');
+            }
             const date = result.publishedAt ?? result.published_at;
             const publishedAt = date && Number.isFinite(new Date(date).valueOf()) && new Date(date) <= new Date() ? new Date(date).toISOString() : null;
             if (!result.content?.trim()) extractionQueue.push({ url, title: result.title || url, snippet: result.snippet ?? '', publishedAt, searchRunId: searchRun.searchRunId, rank: index + 1 });
@@ -81,7 +111,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
       }
     } };
     await Promise.all(Array.from({ length: 5 }, () => searchWorker()));
-    const extractionWorker = async () => { while (extractionQueue.length && discovered < 2000) {
+    const extractionWorker = async () => { while (extractionQueue.length && discovered < 2000 && !timedOut()) {
       const item = extractionQueue.shift(); if (!item) return;
       let content = item.snippet; let extractionFailed = false;
       try {
@@ -98,14 +128,16 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
       app.db.prepare('INSERT OR IGNORE INTO discovery_search_runs(discovery_id,search_run_id,result_rank) VALUES(?,?,?)').run(stored.discoveryId, item.searchRunId, item.rank);
     } };
     await Promise.all(Array.from({ length: 3 }, () => extractionWorker()));
+    pendingSearch = searchQueue.length + extractionQueue.length;
   }
+  if (timedOut() && (queue.length || articleQueue.length || pendingSearch)) { failed++; scanErrorCode ??= ErrorCodes.SCAN_TIMEOUT; }
   app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,heartbeat_at=? WHERE task_id=?').run('analyzing', 'analyzing', 70, discovered, now(), taskId);
   app.taskEvents.emit('changed', taskId);
   const signals = analyzeDiscoveries(app, taskId);
   updateTrends(app, taskId);
   app.db.prepare("UPDATE scan_tasks SET status='generating',current_step='generating',progress=85,signal_count=?,heartbeat_at=? WHERE task_id=?").run(signals, now(), taskId);
   app.taskEvents.emit('changed', taskId);
-  const generated = await generateCards(app, taskId);
+  const generated = await generateCards(app, taskId, deadline);
   failed += generated.failed;
   scanErrorCode ??= generated.errorCode;
   const finalStatus = failed && discovered ? 'partial_failed' : failed ? 'failed' : 'completed';
@@ -150,7 +182,7 @@ export function registerScanRoutes(app: FastifyInstance) {
     const active = app.db.prepare(`SELECT * FROM scan_tasks WHERE status IN (${activeStatuses.map(() => '?').join(',')}) LIMIT 1`).get(...activeStatuses) as Record<string, unknown> | undefined;
     if (active) return reply.send({ code: 0, message: 'success', data: { ...taskView(active), reused: true }, requestId: request.id });
     const sourceCount = (app.db.prepare('SELECT count(*) count FROM sources WHERE enabled = 1').get() as { count: number }).count;
-    if (!sourceCount) throw new BusinessError(ErrorCodes.NO_AVAILABLE_SOURCE);
+    if (!sourceCount && !app.searchClient) throw new BusinessError(ErrorCodes.NO_AVAILABLE_SOURCE);
     const createdAt = now();
     const result = app.db.prepare('INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,?,?,?,?)').run(key, from.toISOString(), to.toISOString(), 'created', createdAt);
     const row = app.db.prepare('SELECT * FROM scan_tasks WHERE task_id = ?').get(result.lastInsertRowid) as Record<string, unknown>;

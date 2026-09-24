@@ -22,11 +22,12 @@ const topicSchema = z.object({
 type Signal = { signalId: number; title: string; summary: string; signalType: string; valueScore: number; monetizationScore: number; adoptionScore: number; contentValueScore: number; evidenceLevel: string; hasConflict: number };
 type Evidence = { discoveryId: number; title: string; url: string; snippet: string };
 
-export async function generateCards(app: FastifyInstance, taskId: number) {
+export async function generateCards(app: FastifyInstance, taskId: number, deadline = Infinity) {
   const counts = { opportunities: 0, topics: 0, failed: 0, errorCode: null as number | null };
   const configured = hasLlmConfig();
   const signals = app.db.prepare('SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.value_score valueScore,s.monetization_score monetizationScore,s.adoption_score adoptionScore,s.content_value_score contentValueScore,s.evidence_level evidenceLevel,s.has_conflict hasConflict FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id WHERE ss.task_id=? ORDER BY s.value_score DESC,s.signal_id DESC').all(taskId) as Signal[];
   for (const signal of signals) {
+    if (Date.now() >= deadline) { counts.failed++; counts.errorCode ??= ErrorCodes.SCAN_TIMEOUT; break; }
     const evidence = app.db.prepare('SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=?').all(signal.signalId) as Evidence[];
     if (!evidence.length) continue;
     const allowed = new Set(evidence.map(({ discoveryId }) => discoveryId));
@@ -57,6 +58,7 @@ export async function generateCards(app: FastifyInstance, taskId: number) {
       const schema = kind === 'opportunity' ? opportunitySchema : topicSchema;
       let saved = false;
       for (let attempt = 0; attempt < 2 && !saved; attempt++) {
+        if (Date.now() >= deadline) { counts.failed++; counts.errorCode ??= ErrorCodes.SCAN_TIMEOUT; break; }
         try {
           const prompt = `cardType:${kind}\n根据以下可核查事实输出中文 JSON。只引用 evidence 中真实存在的 discoveryId；没有证据支持的判断写入风险或不确定性，不能编造数据。不要写整篇文章或脚本。必须提供所有字段，evidenceIds 至少一个。\n${facts}`;
           const card = await generateStructured(prompt, schema);
