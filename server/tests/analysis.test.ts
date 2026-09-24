@@ -87,3 +87,27 @@ test('a later scan updates evidence without restoring a manually archived signal
     assert.equal((db.prepare('SELECT is_highlight highlighted FROM scan_signals WHERE task_id=?').get(nextTask) as { highlighted: number }).highlighted, 0);
   } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('Chinese event joins its earlier signal after more than 100 nearby candidates', async () => {
+  const db = openDatabase(':memory:');
+  const app = createApp({ db, logger: false, autoRunScans: false });
+  const time = '2026-09-23T12:00:00.000Z';
+  const title = 'AI 智能体落地教育服务';
+  const insertDiscovery = db.prepare("INSERT INTO raw_discoveries(url,normalized_url,title,snippet,published_at,published_at_verified,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,1,?,?,'accepted',?,?)");
+  const insertTask = db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,'2026-09-22T00:00:00.000Z','2026-09-24T00:00:00.000Z','completed',?)");
+  try {
+    const firstTask = Number(insertTask.run('chinese-first', time).lastInsertRowid);
+    const firstDiscovery = Number(insertDiscovery.run('https://first.example.org/ai-case', 'https://first.example.org/ai-case', title, '客户场景', time, time, 'first-chinese', time, time).lastInsertRowid);
+    db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,'source',?)").run(firstTask, firstDiscovery, time);
+    assert.equal(analyzeDiscoveries(app, firstTask), 1);
+    const originalId = (db.prepare('SELECT signal_id signalId FROM signals').get() as { signalId: number }).signalId;
+    const insertNoise = db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,rules_version,state,event_at,created_at,updated_at) VALUES(?,?,?,'technology',60,60,60,60,60,60,60,60,'single_source','v1','active',?,?,?)");
+    for (let index = 0; index < 110; index++) insertNoise.run(`noise-${index}`, `腾讯客服方案 ${index}`, 'unrelated', time, time, time);
+    const nextTask = Number(insertTask.run('chinese-next', time).lastInsertRowid);
+    const nextDiscovery = Number(insertDiscovery.run('https://second.example.net/ai-case', 'https://second.example.net/ai-case', `${title}！`, '独立报道', time, time, 'second-chinese', time, time).lastInsertRowid);
+    db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,discovered_at) VALUES(?,?,'source',?)").run(nextTask, nextDiscovery, time);
+    assert.equal(analyzeDiscoveries(app, nextTask), 1);
+    assert.equal((db.prepare('SELECT count(*) count FROM signals').get() as { count: number }).count, 111);
+    assert.equal((db.prepare('SELECT signal_id signalId FROM signal_sources WHERE discovery_id=?').get(nextDiscovery) as { signalId: number }).signalId, originalId);
+  } finally { await app.close(); db.close(); }
+});

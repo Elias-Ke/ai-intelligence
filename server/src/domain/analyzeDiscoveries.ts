@@ -22,12 +22,12 @@ export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
     const date = new Date(observedAt).getTime();
     const from = new Date(date - 72 * 3600_000).toISOString();
     const to = new Date(date + 72 * 3600_000).toISOString();
-    const candidates = app.db.prepare(`SELECT s.signal_id signalId,s.title,s.event_at eventAt FROM signals s WHERE s.event_at BETWEEN ? AND ? ${fts} ORDER BY s.signal_id DESC LIMIT 100`).all(
+    const candidates = app.db.prepare(`SELECT s.signal_id signalId,s.title,s.event_at eventAt FROM signals s WHERE s.event_at BETWEEN ? AND ? ${fts} ORDER BY s.signal_id DESC`).all(
       from, to,
       ...(tokens.length ? [match] : [])
     ) as Candidate[];
-    // FTS5's unicode tokenizer indexes a whole Chinese phrase; search the dated window when no Latin tokens match.
-    const nearby = candidates.length || !tokens.length ? candidates : app.db.prepare('SELECT signal_id signalId,title,event_at eventAt FROM signals WHERE event_at BETWEEN ? AND ? ORDER BY signal_id DESC LIMIT 100').all(from, to) as Candidate[];
+    // ponytail: Chinese FTS can miss token matches, so scan the dated window; index event tokens if this becomes slow.
+    const nearby = candidates.length || !tokens.length ? candidates : app.db.prepare('SELECT signal_id signalId,title,event_at eventAt FROM signals WHERE event_at BETWEEN ? AND ? ORDER BY signal_id DESC').all(from, to) as Candidate[];
     const related = nearby.find((candidate) => eventSimilarity(title, candidate.title) >= 0.82);
     const clusterKey = createHash('sha256').update(`${discovery.normalized_url}:${discovery.content_hash}`).digest('hex');
     if (!related) app.db.prepare("INSERT OR IGNORE INTO signals(cluster_key,title,summary,signal_type,tags_text,search_text,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,has_conflict,score_explanation_json,rules_version,state,event_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(clusterKey, title, summary, assessment.type, 'AI', `${title} ${summary}`, assessment.relevance, assessment.scores.novelty, assessment.scores.truth, assessment.scores.technology, assessment.scores.adoption, assessment.scores.monetization, assessment.scores.contentValue, assessment.value, assessment.evidenceLevel, 0, JSON.stringify(assessment.explanation), 'v1', !discovery.published_at || assessment.value < 65 ? 'needs_review' : 'active', observedAt, timestamp, timestamp);
