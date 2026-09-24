@@ -52,7 +52,7 @@ test('scan persists 80 AnySearch runs and connects repeated results to their req
   const db = openDatabase(join(dir, 'test.db'));
   db.prepare('UPDATE sources SET enabled=0 WHERE source_id!=1').run();
   const publishedAt = new Date(Date.now() - 3_600_000).toISOString();
-  const searchClient = new AnySearchClient('https://api.anysearch.com', 'test-key', async () => new Response(JSON.stringify({ code: 0, request_id: 'provider-request-1', data: { results: [{ title: 'Published AI use case', url: 'https://example.org/real-case', snippet: 'Real case detail', publishedAt }] } }), { status: 200 }));
+  const searchClient = new AnySearchClient('https://api.anysearch.com', 'test-key', async () => new Response(JSON.stringify({ code: 0, request_id: 'provider-request-1', data: { results: [{ title: 'Published AI use case', url: 'https://example.org/real-case', snippet: 'Real case detail', content: 'Verified public case body', publishedAt }] } }), { status: 200 }));
   const app = createApp({ db, logger: false, autoRunScans: false, searchClient, fetchSource: async (url) => ({ url, contentType: 'text/html', text: '<html><body>Empty index</body></html>' }) });
   try {
     const result = await app.inject({ method: 'POST', url: '/api/scans', headers: { 'idempotency-key': 'search-provenance' }, payload: { range: '24h' } });

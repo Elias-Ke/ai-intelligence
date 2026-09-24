@@ -27,10 +27,11 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   app.taskEvents.emit('changed', taskId);
   const sources = app.db.prepare('SELECT source_id sourceId,url,kind FROM sources WHERE enabled=1 ORDER BY source_id').all() as { sourceId: number; url: string; kind: 'rss' | 'api' | 'web' }[];
   let failed = 0; let discovered = 0; let scanErrorCode: number | null = null;
-  const saveDiscovery = app.db.transaction((sourceId: number | null, url: string, title: string, content: string, channel: 'source' | 'anysearch', publishedAt: string | null) => {
+  const saveDiscovery = app.db.transaction((sourceId: number | null, url: string, title: string, content: string, channel: 'source' | 'anysearch', publishedAt: string | null, extractionFailed = false) => {
     const timestamp = now(); const normalizedUrl = new URL(url).toString(); const hash = createHash('sha256').update(content).digest('hex');
-    const status = publishedAt ? new Date(publishedAt) >= rangeFrom && new Date(publishedAt) <= rangeTo ? 'accepted' : 'rejected' : 'candidate';
-    app.db.prepare("INSERT OR IGNORE INTO raw_discoveries(source_id,url,normalized_url,title,snippet,content,published_at,published_at_verified,fetched_at,content_hash,status,rejection_reason,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sourceId, url, normalizedUrl, title, content.slice(0, 300), content.slice(0, 50000), publishedAt, publishedAt ? 1 : 0, timestamp, hash, status, status === 'rejected' ? 'outside_scan_range' : null, timestamp, timestamp);
+    const inRange = !publishedAt || new Date(publishedAt) >= rangeFrom && new Date(publishedAt) <= rangeTo;
+    const status = !inRange ? 'rejected' : extractionFailed ? 'extract_failed' : publishedAt ? 'accepted' : 'candidate';
+    app.db.prepare("INSERT OR IGNORE INTO raw_discoveries(source_id,url,normalized_url,title,snippet,content,published_at,published_at_verified,fetched_at,content_hash,status,rejection_reason,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(sourceId, url, normalizedUrl, title, content.slice(0, 300), content.slice(0, 50000), publishedAt, publishedAt ? 1 : 0, timestamp, hash, status, status === 'rejected' ? 'outside_scan_range' : extractionFailed ? 'extraction_failed' : null, timestamp, timestamp);
     const row = app.db.prepare('SELECT discovery_id discoveryId FROM raw_discoveries WHERE normalized_url=? AND content_hash=?').get(normalizedUrl, hash) as { discoveryId: number };
     if (publishedAt) app.db.prepare("UPDATE raw_discoveries SET published_at=?,published_at_verified=1,status=?,rejection_reason=?,last_seen_at=? WHERE discovery_id=? AND published_at_verified=0").run(publishedAt, status, status === 'rejected' ? 'outside_scan_range' : null, timestamp, row.discoveryId);
     const linked = app.db.prepare('SELECT discovery_channel FROM scan_discoveries WHERE task_id=? AND discovery_id=?').get(taskId, row.discoveryId) as { discovery_channel: string } | undefined;
@@ -43,6 +44,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   await Promise.all(Array.from({ length: Math.min(8, sources.length) }, () => worker()));
   if (app.searchClient) {
     const searchQueue = buildSearchQueries();
+    const extractionQueue: { url: string; title: string; snippet: string; publishedAt: string | null; searchRunId: number; rank: number }[] = [];
     let quotaExhausted = false;
     const searchWorker = async () => { while (searchQueue.length && discovered < 2000 && !quotaExhausted) {
       const query = searchQueue.shift(); if (!query) return;
@@ -56,9 +58,12 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
             const url = publicUrl(result.url).toString();
             const date = result.publishedAt ?? result.published_at;
             const publishedAt = date && Number.isFinite(new Date(date).valueOf()) && new Date(date) <= new Date() ? new Date(date).toISOString() : null;
-            const stored = saveDiscovery(null, url, result.title || url, result.content ?? result.snippet ?? '', 'anysearch', publishedAt);
-            if (stored.isNew) discovered += 1;
-            app.db.prepare('INSERT OR IGNORE INTO discovery_search_runs(discovery_id,search_run_id,result_rank) VALUES(?,?,?)').run(stored.discoveryId, searchRun.searchRunId, index + 1);
+            if (!result.content?.trim()) extractionQueue.push({ url, title: result.title || url, snippet: result.snippet ?? '', publishedAt, searchRunId: searchRun.searchRunId, rank: index + 1 });
+            else {
+              const stored = saveDiscovery(null, url, result.title || url, result.content, 'anysearch', publishedAt);
+              if (stored.isNew) discovered += 1;
+              app.db.prepare('INSERT OR IGNORE INTO discovery_search_runs(discovery_id,search_run_id,result_rank) VALUES(?,?,?)').run(stored.discoveryId, searchRun.searchRunId, index + 1);
+            }
           } catch (error) { if (!(error instanceof BusinessError)) throw error; }
         }
         app.db.prepare("UPDATE search_runs SET status='completed',anysearch_request_id=?,result_count=?,duration_ms=?,finished_at=? WHERE search_run_id=?").run(requestId, results.length, Date.now() - started, now(), searchRun.searchRunId);
@@ -73,6 +78,23 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
       }
     } };
     await Promise.all(Array.from({ length: 5 }, () => searchWorker()));
+    const extractionWorker = async () => { while (extractionQueue.length && discovered < 2000) {
+      const item = extractionQueue.shift(); if (!item) return;
+      let content = item.snippet; let extractionFailed = false;
+      try {
+        const extracted = await app.searchClient!.extract(item.url);
+        content = extracted.content;
+        app.log.info({ event: 'anysearch.extract.completed', taskId, searchRunId: item.searchRunId, anysearchRequestId: extracted.requestId }, 'AnySearch extract completed');
+      } catch (error) {
+        const code = error instanceof BusinessError ? error.code : ErrorCodes.EXTRACTION_FAILED;
+        extractionFailed = true; failed += 1; scanErrorCode ??= code;
+        app.log.warn({ event: 'anysearch.extract.failed', taskId, searchRunId: item.searchRunId, businessCode: code }, 'AnySearch extract failed');
+      }
+      const stored = saveDiscovery(null, item.url, item.title, content, 'anysearch', item.publishedAt, extractionFailed);
+      if (stored.isNew) discovered += 1;
+      app.db.prepare('INSERT OR IGNORE INTO discovery_search_runs(discovery_id,search_run_id,result_rank) VALUES(?,?,?)').run(stored.discoveryId, item.searchRunId, item.rank);
+    } };
+    await Promise.all(Array.from({ length: 3 }, () => extractionWorker()));
   }
   app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,heartbeat_at=? WHERE task_id=?').run('analyzing', 'analyzing', 70, discovered, now(), taskId);
   app.taskEvents.emit('changed', taskId);
