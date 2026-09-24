@@ -6,6 +6,7 @@ import { parseSource } from '../ingestion/parseSource.js';
 import { publicUrl } from '../ingestion/publicHttp.js';
 import { buildSearchQueries, QUERY_VERSION } from '../ingestion/searchQueries.js';
 import { analyzeDiscoveries } from '../domain/analyzeDiscoveries.js';
+import { updateTrends } from '../domain/trends.js';
 import { generateCards } from '../generation/cards.js';
 
 const activeStatuses = ['created', 'collecting', 'normalizing', 'clustering', 'analyzing', 'generating', 'retrying'];
@@ -101,6 +102,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,heartbeat_at=? WHERE task_id=?').run('analyzing', 'analyzing', 70, discovered, now(), taskId);
   app.taskEvents.emit('changed', taskId);
   const signals = analyzeDiscoveries(app, taskId);
+  updateTrends(app, taskId);
   app.db.prepare("UPDATE scan_tasks SET status='generating',current_step='generating',progress=85,signal_count=?,heartbeat_at=? WHERE task_id=?").run(signals, now(), taskId);
   app.taskEvents.emit('changed', taskId);
   const generated = await generateCards(app, taskId);
