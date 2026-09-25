@@ -56,6 +56,10 @@ test('discovery and signal cursors traverse unique results across scans and reje
     const scoped = (await app.inject(`/api/signals?taskId=${tasks[0]}&limit=10`)).json();
     assert.deepEqual(scoped.data.items.map((item: { signalId: number }) => item.signalId), [signalIds[1], signalIds[0], signalIds[2]]);
     assert.equal((await app.inject(`/api/discoveries?taskId=${tasks[0]}`)).json().data.items.length, 3);
+    const firstDiscoveryPage = (await app.inject(`/api/discoveries?taskId=${tasks[0]}&limit=1`)).json().data;
+    db.prepare('UPDATE raw_discoveries SET last_seen_at=? WHERE discovery_id=?').run('2026-09-25T00:00:00.000Z', discoveryIds[0]);
+    const secondDiscoveryPage = (await app.inject(`/api/discoveries?taskId=${tasks[0]}&limit=1&cursor=${encodeURIComponent(firstDiscoveryPage.nextCursor)}`)).json().data;
+    assert.deepEqual(secondDiscoveryPage.items.map((item: { discoveryId: number }) => item.discoveryId), [discoveryIds[1]]);
   } finally {
     await app.close(); db.close(); rmSync(directory, { recursive: true, force: true });
   }

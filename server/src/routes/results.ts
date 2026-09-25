@@ -31,10 +31,11 @@ export function registerResultRoutes(app: FastifyInstance) {
     if (q.publishedAtVerified !== undefined) { clauses.push('d.published_at_verified=?'); params.push(bool(q.publishedAtVerified, ErrorCodes.INVALID_DISCOVERY_FILTER, 'publishedAtVerified')); }
     if (q.q) { clauses.push('(d.title LIKE ? OR d.url LIKE ?)'); params.push(`%${q.q}%`, `%${q.q}%`); }
     const cursor = readCursor('discoveries', q, 2);
-    if (cursor) { clauses.push('(d.last_seen_at,d.discovery_id) < (?,?)'); params.push(...cursor); }
+    if (cursor) { clauses.push(taskId ? '(sd.discovered_at,d.discovery_id) < (?,?)' : '(d.last_seen_at,d.discovery_id) < (?,?)'); params.push(...cursor); }
     const channel = taskId ? 'sd.discovery_channel' : '(SELECT sd.discovery_channel FROM scan_discoveries sd WHERE sd.discovery_id=d.discovery_id ORDER BY sd.task_id DESC LIMIT 1)';
-    const rows = app.db.prepare(`SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,s.name sourceName,${channel} channel,d.published_at publishedAt,d.published_at_verified publishedAtVerified,${status} status,${rejectionReason} rejectionReason,d.first_seen_at firstSeenAt,d.last_seen_at lastSeenAt FROM raw_discoveries d LEFT JOIN sources s ON s.source_id=d.source_id ${taskId ? 'JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id AND sd.task_id=? JOIN scan_tasks t ON t.task_id=sd.task_id' : ''} ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY d.last_seen_at DESC,d.discovery_id DESC LIMIT ?`).all(...(taskId ? [taskId] : []), ...params, limit + 1) as { discoveryId: number; lastSeenAt: string }[];
-    return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('discoveries', q, [row.lastSeenAt, row.discoveryId])), requestId: request.id });
+    const rows = app.db.prepare(`SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,s.name sourceName,${channel} channel,d.published_at publishedAt,d.published_at_verified publishedAtVerified,${status} status,${rejectionReason} rejectionReason,d.first_seen_at firstSeenAt,d.last_seen_at lastSeenAt,${taskId ? 'sd.discovered_at' : 'd.last_seen_at'} scanSeenAt FROM raw_discoveries d LEFT JOIN sources s ON s.source_id=d.source_id ${taskId ? 'JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id AND sd.task_id=? JOIN scan_tasks t ON t.task_id=sd.task_id' : ''} ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${taskId ? 'sd.discovered_at' : 'd.last_seen_at'} DESC,d.discovery_id DESC LIMIT ?`).all(...(taskId ? [taskId] : []), ...params, limit + 1) as { discoveryId: number; lastSeenAt: string; scanSeenAt: string }[];
+    const page = paged(rows, limit, (row) => writeCursor('discoveries', q, [row.scanSeenAt, row.discoveryId]));
+    return reply.send({ code: 0, message: 'success', data: { ...page, items: page.items.map(({ scanSeenAt: _scanSeenAt, ...row }) => row) }, requestId: request.id });
   });
 
   app.get('/api/signals', async (request, reply) => {

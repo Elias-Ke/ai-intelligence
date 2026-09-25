@@ -106,6 +106,8 @@ test('a later failed extraction cannot feature or generate cards from an earlier
       const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
       assert.equal(discovery.status, attempt === 1 ? 'accepted' : 'extract_failed');
       assert.equal(signal.isHighlighted, attempt === 1 ? 1 : 0);
+      assert.equal(signal.evidenceLevel, attempt === 1 ? 'first_party' : 'single_source');
+      assert.equal(signal.state, attempt === 1 ? 'active' : 'needs_review');
       if (attempt === 2) assert.equal((db.prepare("SELECT status FROM scan_task_steps WHERE task_id=? AND step_name='generating'").get(taskId) as { status: string }).status, 'completed');
       fail = true;
     }
@@ -148,7 +150,7 @@ test('successful re-extraction upgrades a reused failed discovery and its signal
       if (fail) throw new Error('temporary article failure');
       return { url, contentType: 'text/html', text: '<article>Customer workflow</article>' };
     }
-    return { url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>AI Agent deployed in schools</title><link>https://example.org/ai-case</link><description>Customer workflow</description><pubDate>${published}</pubDate></item></channel></rss>` };
+    return { url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>AI Agent deployed in schools</title><link>https://openai.com/ai-case</link><description>Customer workflow</description><pubDate>${published}</pubDate></item></channel></rss>` };
   } });
   try {
     const tasks: number[] = [];
@@ -159,7 +161,7 @@ test('successful re-extraction upgrades a reused failed discovery and its signal
       await executeScan(app, taskId, start, end);
       const row = db.prepare('SELECT status,rejection_reason rejectionReason FROM raw_discoveries').get() as { status: string; rejectionReason: string | null };
       assert.deepEqual(row, attempt === 1 ? { status: 'extract_failed', rejectionReason: 'extraction_failed' } : { status: 'accepted', rejectionReason: null });
-      assert.equal((db.prepare('SELECT state FROM signals').get() as { state: string }).state, attempt === 1 ? 'needs_review' : 'active');
+      assert.equal((db.prepare('SELECT state FROM signals').get() as { state: string }).state, attempt === 1 || attempt === 3 ? 'needs_review' : 'active');
       fail = attempt === 2;
     }
     assert.equal((await app.inject(`/api/discoveries?taskId=${tasks[0]}&status=extract_failed`)).json().data.items[0].rejectionReason, 'extraction_failed');

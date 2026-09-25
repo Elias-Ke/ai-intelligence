@@ -30,7 +30,7 @@ export async function generateCards(app: FastifyInstance, taskId: number, deadli
     if (Date.now() >= deadline) { counts.failed++; counts.errorCode ??= ErrorCodes.SCAN_TIMEOUT; break; }
     const acceptedThisScan = app.db.prepare("SELECT 1 FROM signal_sources ss JOIN scan_discoveries sd ON sd.discovery_id=ss.discovery_id JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND sd.task_id=? AND COALESCE(sd.status,d.status)='accepted' LIMIT 1").get(signal.signalId, taskId);
     if (!acceptedThisScan) continue;
-    const evidence = app.db.prepare("SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,d.published_at publishedAt FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id LEFT JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id AND sd.task_id=? WHERE ss.signal_id=? AND COALESCE(sd.status,d.status) IN ('accepted','candidate')").all(taskId, signal.signalId) as Evidence[];
+    const evidence = app.db.prepare("SELECT d.discovery_id discoveryId,d.title,d.url,d.snippet,d.published_at publishedAt FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id AND sd.task_id=? WHERE ss.signal_id=? AND COALESCE(sd.status,d.status)='accepted'").all(taskId, signal.signalId) as Evidence[];
     if (!evidence.length) continue;
     const allowed = new Set(evidence.map(({ discoveryId }) => discoveryId));
     const facts = JSON.stringify({ signalId: signal.signalId, title: signal.title, summary: signal.summary, evidence: evidence.map(({ discoveryId, title, url, snippet, publishedAt }) => ({ discoveryId, title, url, snippet: snippet.slice(0, 300), publishedAt })) });

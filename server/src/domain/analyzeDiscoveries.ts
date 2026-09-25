@@ -36,8 +36,8 @@ export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
     const sameUrl = existing.some((row) => row.normalizedUrl === discovery.normalized_url);
     const conflict = existing.some((row) => contradicts(title, row.title));
     app.db.prepare('INSERT OR IGNORE INTO signal_sources(signal_id,discovery_id,relation_type,is_independent,added_at) VALUES(?,?,?,?,?)').run(signalId, discovery.discovery_id, conflict ? 'conflicting' : sameUrl ? 'duplicate' : existing.length ? 'supporting' : 'primary', 0, timestamp);
-    const evidenceCount = (app.db.prepare('SELECT count(*) count FROM signal_sources WHERE signal_id=?').get(signalId) as { count: number }).count;
-    const evidence = app.db.prepare('SELECT ss.discovery_id discoveryId,ss.is_independent isIndependent,d.url,d.status FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? ORDER BY ss.discovery_id').all(signalId) as { discoveryId: number; isIndependent: number; url: string; status: string }[];
+    const evidence = app.db.prepare("SELECT ss.discovery_id discoveryId,ss.is_independent isIndependent,d.url,COALESCE(sd.status,d.status) status FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id AND sd.task_id=? WHERE ss.signal_id=? ORDER BY ss.discovery_id").all(taskId, signalId) as { discoveryId: number; isIndependent: number; url: string; status: string }[];
+    const evidenceCount = evidence.length;
     const independentHosts = new Set<string>();
     for (const row of evidence) {
       const host = new URL(row.url).hostname.replace(/^www\./, '');
@@ -46,10 +46,10 @@ export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
       if (row.isIndependent !== independent) app.db.prepare('UPDATE signal_sources SET is_independent=? WHERE signal_id=? AND discovery_id=?').run(independent, signalId, row.discoveryId);
     }
     const independentCount = independentHosts.size;
-    const datedCount = (app.db.prepare('SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.published_at_verified=1').get(signalId) as { count: number }).count;
-    const verifiedCount = (app.db.prepare("SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.published_at_verified=1 AND d.status='accepted'").get(signalId) as { count: number }).count;
-    const completeCount = (app.db.prepare("SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND d.status='accepted'").get(signalId) as { count: number }).count;
-    const hasFirstParty = (app.db.prepare("SELECT d.url articleUrl,src.url sourceUrl FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id JOIN sources src ON src.source_id=d.source_id WHERE ss.signal_id=? AND d.status='accepted' AND src.trust_level=5").all(signalId) as { articleUrl: string; sourceUrl: string }[]).some(({ articleUrl, sourceUrl }) => isFirstPartyArticle(sourceUrl, articleUrl));
+    const datedCount = (app.db.prepare('SELECT count(*) count FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id AND sd.task_id=? WHERE ss.signal_id=? AND d.published_at_verified=1').get(taskId, signalId) as { count: number }).count;
+    const verifiedCount = evidence.filter((row) => row.status === 'accepted').length;
+    const completeCount = verifiedCount;
+    const hasFirstParty = (app.db.prepare("SELECT d.url articleUrl,src.url sourceUrl FROM signal_sources ss JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id JOIN scan_discoveries sd ON sd.discovery_id=d.discovery_id AND sd.task_id=? JOIN sources src ON src.source_id=d.source_id WHERE ss.signal_id=? AND COALESCE(sd.status,d.status)='accepted' AND src.trust_level=5").all(taskId, signalId) as { articleUrl: string; sourceUrl: string }[]).some(({ articleUrl, sourceUrl }) => isFirstPartyArticle(sourceUrl, articleUrl));
     const prior = app.db.prepare('SELECT evidence_level evidenceLevel,has_conflict hasConflict,truth_score truthScore,value_score valueScore,state FROM signals WHERE signal_id=?').get(signalId) as { evidenceLevel: string; hasConflict: number; truthScore: number; valueScore: number; state: string };
     const hasConflict = conflict || Boolean(prior.hasConflict);
     const evidenceLevel = hasConflict ? 'conflicting' : hasFirstParty ? 'first_party' : independentCount >= 2 ? 'multi_source' : 'single_source';
