@@ -17,7 +17,7 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('cards-test','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run(time).lastInsertRowid);
   const discoveryId = Number(db.prepare("INSERT INTO raw_discoveries(url,normalized_url,title,snippet,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES('https://example.org/case','https://example.org/case','AI deployment','Public example',?,'case-hash','accepted',?,?)").run(time, time, time).lastInsertRowid);
   const signalId = Number(db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,has_conflict,rules_version,state,event_at,created_at,updated_at) VALUES('card-cluster','AI 部署案例','公开报道','use_case',65,65,70,50,70,60,65,64,'first_party',0,'v1','active',?,?,?)").run(time, time, time).lastInsertRowid);
-  db.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,created_at) VALUES(?,?,1,?)').run(taskId, signalId, time);
+  db.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,created_at) VALUES(?,?,1,65,70,50,70,60,65,64,?)').run(taskId, signalId, time);
   db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,status,discovered_at) VALUES(?,?,'source','accepted',?)").run(taskId, discoveryId, time);
   db.prepare("INSERT INTO signal_sources(signal_id,discovery_id,relation_type,added_at) VALUES(?,?,'primary',?)").run(signalId, discoveryId, time);
   let opportunityCalls = 0;
@@ -54,10 +54,12 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   assert.equal((db.prepare('SELECT count(*) count FROM opportunities').get() as { count: number }).count, 1);
   assert.match((db.prepare('SELECT summary FROM signals WHERE signal_id=?').get(signalId) as { summary: string }).summary, /实际部署/);
   db.prepare('UPDATE signals SET monetization_score=50,adoption_score=50 WHERE signal_id=?').run(signalId);
+  assert.deepEqual(await generateCards(app, taskId), { opportunities: 1, topics: 1, failed: 0, errorCode: null });
+  db.prepare('UPDATE scan_signals SET monetization_score=50,adoption_score=50 WHERE task_id=? AND signal_id=?').run(taskId, signalId);
   assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 1, failed: 0, errorCode: null });
   db.prepare('UPDATE signals SET monetization_score=60,adoption_score=60 WHERE signal_id=?').run(signalId);
   delete process.env.LLM_MODEL;
-  assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 0, failed: 2, errorCode: 910004 });
+  assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 0, failed: 1, errorCode: 910004 });
   assert.match((db.prepare('SELECT summary FROM signals WHERE signal_id=?').get(signalId) as { summary: string }).summary, /实际部署/);
   db.prepare("UPDATE signals SET summary='' WHERE signal_id=?").run(signalId);
   await generateCards(app, taskId);
@@ -70,6 +72,6 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   assert.equal((db.prepare('SELECT count(*) count FROM content_topics').get() as { count: number }).count, 1);
   assert.equal((db.prepare('SELECT status FROM opportunities').get() as { status: string }).status, 'verified');
   forceInvalid = true;
-  assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 0, failed: 2, errorCode: 910003 });
+  assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 0, failed: 1, errorCode: 910003 });
   assert.equal((db.prepare('SELECT count(*) count FROM opportunities').get() as { count: number }).count, 1);
 });

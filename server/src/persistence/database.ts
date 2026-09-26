@@ -17,7 +17,12 @@ export function openDatabase(path: string): SqliteDatabase {
     const snapshots = [
       ['evidence_level', "TEXT CHECK(evidence_level IN ('single_source','multi_source','first_party','conflicting'))"],
       ['state', "TEXT CHECK(state IN ('active','needs_review','archived'))"],
+      ['novelty_score', 'INTEGER CHECK(novelty_score BETWEEN 0 AND 100)'],
       ['truth_score', 'INTEGER CHECK(truth_score BETWEEN 0 AND 100)'],
+      ['technology_score', 'INTEGER CHECK(technology_score BETWEEN 0 AND 100)'],
+      ['adoption_score', 'INTEGER CHECK(adoption_score BETWEEN 0 AND 100)'],
+      ['monetization_score', 'INTEGER CHECK(monetization_score BETWEEN 0 AND 100)'],
+      ['content_value_score', 'INTEGER CHECK(content_value_score BETWEEN 0 AND 100)'],
       ['value_score', 'INTEGER CHECK(value_score BETWEEN 0 AND 100)'],
       ['evidence_count', 'INTEGER CHECK(evidence_count>=0)'],
       ['published_at_verified', 'INTEGER CHECK(published_at_verified IN (0,1))']
