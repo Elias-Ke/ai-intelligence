@@ -124,7 +124,10 @@ test('a later failed extraction cannot feature or generate cards from an earlier
         assert.equal(historical.evidenceLevel, 'first_party');
         assert.equal(historical.evidenceCount, 1);
         assert.equal(historical.evidence.length, 1);
+        assert.equal(historical.evidence[0].isIndependent, 1);
         assert.equal(historical.isHighlighted, 1);
+        const current = (await app.inject(`/api/signals/${signalId}?taskId=${taskId}`)).json().data;
+        assert.equal(current.evidence[0].isIndependent, 0);
       }
       fail = true;
     }
