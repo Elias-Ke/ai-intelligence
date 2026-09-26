@@ -13,6 +13,16 @@ export function openDatabase(path: string): SqliteDatabase {
     const columns = new Set((db.pragma('table_info(scan_discoveries)') as { name: string }[]).map(({ name }) => name));
     if (!columns.has('status')) db.exec("ALTER TABLE scan_discoveries ADD COLUMN status TEXT CHECK(status IN ('candidate','accepted','rejected','extract_failed'))");
     if (!columns.has('rejection_reason')) db.exec('ALTER TABLE scan_discoveries ADD COLUMN rejection_reason TEXT');
+    const signalColumns = new Set((db.pragma('table_info(scan_signals)') as { name: string }[]).map(({ name }) => name));
+    const snapshots = [
+      ['evidence_level', "TEXT CHECK(evidence_level IN ('single_source','multi_source','first_party','conflicting'))"],
+      ['state', "TEXT CHECK(state IN ('active','needs_review','archived'))"],
+      ['truth_score', 'INTEGER CHECK(truth_score BETWEEN 0 AND 100)'],
+      ['value_score', 'INTEGER CHECK(value_score BETWEEN 0 AND 100)'],
+      ['evidence_count', 'INTEGER CHECK(evidence_count>=0)'],
+      ['published_at_verified', 'INTEGER CHECK(published_at_verified IN (0,1))']
+    ] as const;
+    for (const [name, definition] of snapshots) if (!signalColumns.has(name)) db.exec(`ALTER TABLE scan_signals ADD COLUMN ${name} ${definition}`);
     seedSources(db);
   })(); }
   catch (error) { db.close(); throw error; }

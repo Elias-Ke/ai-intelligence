@@ -48,6 +48,23 @@ test('production migration adds scan status snapshots to an existing database on
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('production migration adds signal snapshots to an existing database only once', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'intelligence-legacy-signals-')); const path = join(directory, 'main.db');
+  const names = ['evidence_level', 'state', 'truth_score', 'value_score', 'evidence_count', 'published_at_verified'];
+  try {
+    const old = openDatabase(path);
+    for (const name of names) old.exec(`ALTER TABLE scan_signals DROP COLUMN ${name}`);
+    old.close();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const db = openDatabase(path);
+      try {
+        const columns = db.pragma('table_info(scan_signals)') as { name: string }[];
+        assert.equal(columns.filter(({ name }) => names.includes(name)).length, names.length);
+      } finally { db.close(); }
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('state changes emit safe correlated events only after successful writes', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'intelligence-logs-')); const db = openDatabase(join(directory, 'main.db'));
   const app = createApp({ db, logger: false, autoRunScans: false });

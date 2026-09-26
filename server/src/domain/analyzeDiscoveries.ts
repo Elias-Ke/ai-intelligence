@@ -59,7 +59,8 @@ export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
     const acceptedThisScan = app.db.prepare("SELECT 1 FROM signal_sources ss JOIN scan_discoveries sd ON sd.discovery_id=ss.discovery_id JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND sd.task_id=? AND COALESCE(sd.status,d.status)='accepted' LIMIT 1").get(signalId, taskId);
     const highlight = prior.state !== 'archived' && Boolean(acceptedThisScan) && valueScore >= 65 && verifiedCount > 0 && completeCount > 0 && !hasConflict && evidenceLevel !== 'single_source' ? 1 : 0;
     app.db.prepare('INSERT OR IGNORE INTO scan_signals(task_id,signal_id,rank_no,is_highlight,created_at) VALUES(?,?,?,?,?)').run(taskId, signalId, rank, highlight, timestamp);
-    app.db.prepare('UPDATE scan_signals SET is_highlight=? WHERE task_id=? AND signal_id=?').run(highlight, taskId, signalId);
+    const scored = app.db.prepare('SELECT state FROM signals WHERE signal_id=?').get(signalId) as { state: string };
+    app.db.prepare('UPDATE scan_signals SET is_highlight=?,evidence_level=?,state=?,truth_score=?,value_score=?,evidence_count=?,published_at_verified=? WHERE task_id=? AND signal_id=?').run(highlight, evidenceLevel, scored.state, truthScore, valueScore, evidenceCount, datedCount ? 1 : 0, taskId, signalId);
     app.log.info({ event: 'analysis.signal.scored', taskId, signalId, discoveryId: discovery.discovery_id, rulesVersion: 'v1', valueScore, evidenceCount, evidenceLevel, businessCode: 0 }, 'signal scored');
     if (conflict) app.log.warn({ event: 'analysis.evidence.conflict', taskId, signalId, discoveryId: discovery.discovery_id, businessCode: 0 }, 'conflicting evidence');
     return true;

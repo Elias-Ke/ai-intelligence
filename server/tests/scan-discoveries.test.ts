@@ -98,9 +98,11 @@ test('a later failed extraction cannot feature or generate cards from an earlier
     return { url, contentType: 'application/rss+xml', text: `<rss><channel><item><title>AI agent launched and deployed in production with research funding</title><link>${articleUrl}</link><description>Customer workflow pricing</description><pubDate>${published}</pubDate></item></channel></rss>` };
   } });
   try {
+    let firstTaskId = 0;
     for (const attempt of [1, 2]) {
       const end = new Date(); const start = new Date(end.getTime() - 86_400_000);
       const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,?,?,'created',?)").run(`reused-evidence-${attempt}`, start.toISOString(), end.toISOString(), end.toISOString()).lastInsertRowid);
+      if (attempt === 1) firstTaskId = taskId;
       await executeScan(app, taskId, start, end);
       const discovery = (await app.inject(`/api/discoveries?taskId=${taskId}`)).json().data.items[0];
       const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
@@ -108,7 +110,14 @@ test('a later failed extraction cannot feature or generate cards from an earlier
       assert.equal(signal.isHighlighted, attempt === 1 ? 1 : 0);
       assert.equal(signal.evidenceLevel, attempt === 1 ? 'first_party' : 'single_source');
       assert.equal(signal.state, attempt === 1 ? 'active' : 'needs_review');
-      if (attempt === 2) assert.equal((db.prepare("SELECT status FROM scan_task_steps WHERE task_id=? AND step_name='generating'").get(taskId) as { status: string }).status, 'completed');
+      if (attempt === 2) {
+        assert.equal((db.prepare("SELECT status FROM scan_task_steps WHERE task_id=? AND step_name='generating'").get(taskId) as { status: string }).status, 'completed');
+        const earlier = (await app.inject(`/api/signals?taskId=${firstTaskId}`)).json().data.items[0];
+        assert.equal(earlier.state, 'active');
+        assert.equal(earlier.evidenceLevel, 'first_party');
+        assert.equal(earlier.isHighlighted, 1);
+        assert.equal((await app.inject(`/api/signals?taskId=${firstTaskId}&state=active&evidenceLevel=first_party&highlighted=true`)).json().data.items.length, 1);
+      }
       fail = true;
     }
   } finally { await app.close(); db.close(); }
