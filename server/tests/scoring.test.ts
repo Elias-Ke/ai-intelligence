@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isFirstPartyArticle, scoreDiscovery } from '../src/domain/scoring.js';
+import { isFirstPartyArticle, registrableDomain, scoreDiscovery } from '../src/domain/scoring.js';
+
+test('registrable domains group sibling subdomains but keep unrelated publishers separate', () => {
+  assert.equal(registrableDomain('https://news.example.org/story'), 'example.org');
+  assert.equal(registrableDomain('https://blog.example.org/story'), 'example.org');
+  assert.equal(registrableDomain('https://team.github.io/story'), 'team.github.io');
+  assert.notEqual(registrableDomain('https://example.org/story'), registrableDomain('https://example.net/story'));
+});
 
 test('relevance keeps unrelated records out of analyzed signals', () => {
   const result = scoreDiscovery({ title: 'Autumn music event', snippet: 'A regional concert', trustLevel: 1 });

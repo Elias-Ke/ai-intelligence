@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
-import { isFirstPartyArticle, scoreDiscovery } from './scoring.js';
+import { isFirstPartyArticle, registrableDomain, scoreDiscovery } from './scoring.js';
 import { contradicts, eventSimilarity, eventTokens } from './clustering.js';
 
 type Discovery = { discovery_id: number; title: string; snippet: string; url: string; normalized_url: string; content_hash: string; published_at: string | null; fetched_at: string; status: string; taskStatus: string; trustLevel: number | null; sourceName: string | null; sourceUrl: string | null };
@@ -40,7 +40,7 @@ export function analyzeDiscoveries(app: FastifyInstance, taskId: number) {
     const evidenceCount = evidence.length;
     const independentHosts = new Set<string>();
     for (const row of evidence) {
-      const host = new URL(row.url).hostname.replace(/^www\./, '');
+      const host = registrableDomain(row.url);
       const independent = row.status === 'accepted' && !independentHosts.has(host) ? 1 : 0;
       if (row.status === 'accepted') independentHosts.add(host);
       if (row.isIndependent !== independent) app.db.prepare('UPDATE signal_sources SET is_independent=? WHERE signal_id=? AND discovery_id=?').run(independent, signalId, row.discoveryId);

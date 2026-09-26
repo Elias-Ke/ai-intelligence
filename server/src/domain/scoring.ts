@@ -1,4 +1,11 @@
+import { getDomain } from 'tldts';
+
 const weights = { novelty: 15, truth: 20, technology: 15, adoption: 20, monetization: 15, contentValue: 15 } as const;
+
+export function registrableDomain(url: string) {
+  const hostname = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+  return getDomain(hostname, { allowPrivateDomains: true }) ?? hostname;
+}
 
 export function isFirstPartyArticle(sourceUrl: string, articleUrl: string) {
   const source = new URL(sourceUrl).hostname.replace(/^www\./, '');
