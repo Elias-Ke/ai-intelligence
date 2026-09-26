@@ -99,6 +99,7 @@ test('a later failed extraction cannot feature or generate cards from an earlier
   } });
   try {
     let firstTaskId = 0;
+    let signalId = 0;
     for (const attempt of [1, 2]) {
       const end = new Date(); const start = new Date(end.getTime() - 86_400_000);
       const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES(?,?,?,'created',?)").run(`reused-evidence-${attempt}`, start.toISOString(), end.toISOString(), end.toISOString()).lastInsertRowid);
@@ -106,6 +107,7 @@ test('a later failed extraction cannot feature or generate cards from an earlier
       await executeScan(app, taskId, start, end);
       const discovery = (await app.inject(`/api/discoveries?taskId=${taskId}`)).json().data.items[0];
       const signal = (await app.inject(`/api/signals?taskId=${taskId}`)).json().data.items[0];
+      if (attempt === 1) signalId = signal.signalId;
       assert.equal(discovery.status, attempt === 1 ? 'accepted' : 'extract_failed');
       assert.equal(signal.isHighlighted, attempt === 1 ? 1 : 0);
       assert.equal(signal.evidenceLevel, attempt === 1 ? 'first_party' : 'single_source');
@@ -117,6 +119,12 @@ test('a later failed extraction cannot feature or generate cards from an earlier
         assert.equal(earlier.evidenceLevel, 'first_party');
         assert.equal(earlier.isHighlighted, 1);
         assert.equal((await app.inject(`/api/signals?taskId=${firstTaskId}&state=active&evidenceLevel=first_party&highlighted=true`)).json().data.items.length, 1);
+        const historical = (await app.inject(`/api/signals/${signalId}?taskId=${firstTaskId}`)).json().data;
+        assert.equal(historical.state, 'active');
+        assert.equal(historical.evidenceLevel, 'first_party');
+        assert.equal(historical.evidenceCount, 1);
+        assert.equal(historical.evidence.length, 1);
+        assert.equal(historical.isHighlighted, 1);
       }
       fail = true;
     }

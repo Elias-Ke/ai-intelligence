@@ -121,7 +121,8 @@ async function openDetails(type: 'signals' | 'opportunities' | 'content-topics' 
   const version = ++detailsVersion;
   details.value = { type, id }; detailsLoading.value = true;
   try {
-    const body = await (await fetch(`/api/${type}/${id}`)).json();
+    const taskQuery = type === 'signals' && view.value === 'stream' && selectedTaskId.value ? `?taskId=${selectedTaskId.value}` : '';
+    const body = await (await fetch(`/api/${type}/${id}${taskQuery}`)).json();
     if (version !== detailsVersion) return;
     if (body.code !== 0) throw new Error(`${body.message}（${body.code}，${body.requestId}）`);
     details.value = { ...body.data, type, id };
