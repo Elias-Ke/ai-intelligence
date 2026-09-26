@@ -3,6 +3,7 @@ import { isFirstPartyArticle } from './scoring.js';
 
 type EntityType = 'company' | 'product' | 'technology' | 'topic' | 'industry' | 'problem';
 type EntityInput = { type: EntityType; name: string; role: 'primary' | 'mentioned' | 'affected' };
+type TrendRow = { signalId: number; title: string; summary: string; signalType: string; eventAt: string | null; articleUrl: string | null; articleStatus: string | null; sourceUrl: string | null; sourceName: string | null; sourceTrust: number | null; relationType: string | null };
 
 const industries = [
   [/教育|学校|教学|学生|school|education|learning/i, '教育'],
@@ -33,8 +34,15 @@ export function identifyEntities(title: string, summary: string, sourceName: str
 }
 
 export function updateTrends(app: FastifyInstance, taskId: number) {
-  const signals = app.db.prepare("SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.event_at eventAt,d.url articleUrl,COALESCE(snapshot.status,d.status) articleStatus,src.url sourceUrl,src.name sourceName,src.trust_level sourceTrust FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id LEFT JOIN signal_sources ev ON ev.signal_id=s.signal_id AND ev.relation_type='primary' AND EXISTS (SELECT 1 FROM scan_discoveries current_sd WHERE current_sd.discovery_id=ev.discovery_id AND current_sd.task_id=ss.task_id) LEFT JOIN raw_discoveries d ON d.discovery_id=ev.discovery_id LEFT JOIN scan_discoveries snapshot ON snapshot.discovery_id=d.discovery_id AND snapshot.task_id=ss.task_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE ss.task_id=? GROUP BY s.signal_id ORDER BY s.signal_id").all(taskId) as { signalId: number; title: string; summary: string; signalType: string; eventAt: string | null; articleUrl: string | null; articleStatus: string | null; sourceUrl: string | null; sourceName: string | null; sourceTrust: number | null }[];
-  const save = app.db.transaction((signal: typeof signals[number]) => {
+  const evidenceRows = app.db.prepare("SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,s.event_at eventAt,d.url articleUrl,COALESCE(snapshot.status,d.status) articleStatus,src.url sourceUrl,src.name sourceName,src.trust_level sourceTrust,ev.relation_type relationType FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id LEFT JOIN signal_sources ev ON ev.signal_id=s.signal_id AND EXISTS (SELECT 1 FROM scan_discoveries current_sd WHERE current_sd.discovery_id=ev.discovery_id AND current_sd.task_id=ss.task_id) LEFT JOIN raw_discoveries d ON d.discovery_id=ev.discovery_id LEFT JOIN scan_discoveries snapshot ON snapshot.discovery_id=d.discovery_id AND snapshot.task_id=ss.task_id LEFT JOIN sources src ON src.source_id=d.source_id WHERE ss.task_id=? ORDER BY s.signal_id,(src.trust_level=5) DESC,(ev.relation_type='primary') DESC,ev.discovery_id").all(taskId) as TrendRow[];
+  const signals = [...new Map(evidenceRows.map((row) => [row.signalId, row])).values()];
+  for (const signal of signals) {
+    const rows = evidenceRows.filter((row) => row.signalId === signal.signalId);
+    const official = rows.find((row) => row.articleStatus === 'accepted' && row.sourceUrl && row.articleUrl && isFirstPartyArticle(row.sourceUrl, row.articleUrl));
+    const selected = official ?? rows.find((row) => row.relationType === 'primary') ?? rows[0];
+    Object.assign(signal, selected ?? { articleUrl: null, articleStatus: null, sourceUrl: null, sourceName: null, sourceTrust: null });
+  }
+  const save = app.db.transaction((signal: TrendRow) => {
     const timestamp = new Date().toISOString();
     const eventAt = signal.eventAt ?? timestamp;
     const eventType = signal.signalType;

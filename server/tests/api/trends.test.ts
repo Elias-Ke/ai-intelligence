@@ -71,3 +71,25 @@ test('external links do not create official company events and stale primary lin
     assert.equal((db.prepare('SELECT count(*) count FROM entity_events WHERE entity_id=?').get(entityId) as { count: number }).count, 0);
   } finally { await app.close(); db.close(); }
 });
+
+test('supporting first-party evidence is used for trend entities', async () => {
+  const db = openDatabase(':memory:');
+  const app = createApp({ db, logger: false, autoRunScans: false });
+  const time = '2026-09-23T12:00:00.000Z';
+  try {
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('trend-supporting','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run(time).lastInsertRowid);
+    const signalId = Number(db.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,rules_version,state,event_at,created_at,updated_at) VALUES('trend-supporting-signal','OpenAI launches AI Agent for schools','Customer case study','use_case',60,60,60,60,60,60,60,70,'multi_source','v1','active',?,?,?)").run(time, time, time).lastInsertRowid);
+    db.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,created_at) VALUES(?,?,1,?)').run(taskId, signalId, time);
+    const openAi = (db.prepare("SELECT source_id sourceId FROM sources WHERE name='OpenAI'").get() as { sourceId: number }).sourceId;
+    const primaryId = Number(db.prepare("INSERT INTO raw_discoveries(url,normalized_url,title,published_at,published_at_verified,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES('https://news.example.org/agent','https://news.example.org/agent','OpenAI launches AI Agent for schools',?,1,?,'trend-primary','accepted',?,?)").run(time, time, time, time).lastInsertRowid);
+    const officialId = Number(db.prepare("INSERT INTO raw_discoveries(source_id,url,normalized_url,title,published_at,published_at_verified,fetched_at,content_hash,status,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,1,?,?,'accepted',?,?)").run(openAi, 'https://openai.com/research/agent', 'https://openai.com/research/agent', 'OpenAI launches AI Agent for schools', time, time, 'trend-official', time, time).lastInsertRowid);
+    for (const discoveryId of [primaryId, officialId]) db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,status,discovered_at) VALUES(?,?,'anysearch','accepted',?)").run(taskId, discoveryId, time);
+    db.prepare("INSERT INTO signal_sources(signal_id,discovery_id,relation_type,added_at) VALUES(?,?,'primary',?)").run(signalId, primaryId, time);
+    db.prepare("INSERT INTO signal_sources(signal_id,discovery_id,relation_type,added_at) VALUES(?,?,'supporting',?)").run(signalId, officialId, time);
+    updateTrends(app, taskId);
+    const entity = db.prepare("SELECT entity_id entityId FROM entities WHERE name='OpenAI'").get() as { entityId: number };
+    assert.ok(entity);
+    assert.equal((db.prepare("SELECT role FROM signal_entities WHERE signal_id=? AND entity_id=?").get(signalId, entity.entityId) as { role: string }).role, 'primary');
+    assert.equal((db.prepare('SELECT count(*) count FROM entity_events WHERE entity_id=? AND signal_id=?').get(entity.entityId, signalId) as { count: number }).count, 1);
+  } finally { await app.close(); db.close(); }
+});
