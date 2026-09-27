@@ -62,6 +62,18 @@ test('classifies timeout and response size failures', async () => {
   );
 });
 
+test('classifies undici timeout and TLS causes', async () => {
+  for (const error of [
+    Object.assign(new Error('connect timeout'), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }),
+    Object.assign(new Error('certificate'), { cause: { code: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' } })
+  ]) {
+    await assert.rejects(
+      fetchPublic('https://example.org/feed', { fetchImpl: async () => { throw error; } }),
+      (actual: unknown) => actual instanceof SourceFetchError && actual.reason === (error.cause.code === 'UND_ERR_CONNECT_TIMEOUT' ? 'timeout' : 'tls_failed')
+    );
+  }
+});
+
 test('rejects unsafe redirect targets', async () => {
   await assert.rejects(
     fetchPublic('https://example.org/feed', {

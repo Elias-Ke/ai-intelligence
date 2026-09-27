@@ -32,9 +32,9 @@ export function publicUrl(input: string): URL {
 function errorReason(error: unknown): SourceErrorReason {
   const candidate = error as { name?: string; code?: string; cause?: { code?: string } } | null;
   const code = candidate?.code ?? candidate?.cause?.code;
-  if (candidate?.name === 'AbortError' || candidate?.name === 'TimeoutError') return 'timeout';
+  if (candidate?.name === 'AbortError' || candidate?.name === 'TimeoutError' || code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT') return 'timeout';
   if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'dns_failed';
-  if (code === 'CERT_HAS_EXPIRED' || code?.startsWith('ERR_TLS')) return 'tls_failed';
+  if (code === 'CERT_HAS_EXPIRED' || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' || code === 'DEPTH_ZERO_SELF_SIGNED_CERT' || code === 'SELF_SIGNED_CERT_IN_CHAIN' || code?.startsWith('ERR_TLS')) return 'tls_failed';
   if (code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH') return 'connection_failed';
   return 'unknown';
 }
