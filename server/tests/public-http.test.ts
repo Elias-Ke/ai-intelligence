@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { publicUrl, fetchPublic } from '../src/ingestion/publicHttp.js';
+import { publicUrl, fetchPublic, selectPublicAddresses } from '../src/ingestion/publicHttp.js';
 
 for (const address of ['127.0.0.1', '10.1.1.2', '172.20.0.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '[::1]', '[::ffff:127.0.0.1]', '[fc00::1]', 'localhost', 'dev.localhost', 'metadata.google.internal']) {
   test(`rejects local or private source address ${address}`, () => {
@@ -14,8 +14,8 @@ for (const address of ['file:///etc/passwd', 'ftp://example.org/feed', 'http://u
   });
 }
 
-test('rejects a public hostname resolving to a private or mixed private address', async () => {
+test('rejects private-only DNS results and keeps public addresses from mixed results', async () => {
   await assert.rejects(fetchPublic('https://example.org/feed', { resolve: async () => [{ address: '127.0.0.1', family: 4 }] }), { code: 800005 });
-  await assert.rejects(fetchPublic('https://example.org/feed', { resolve: async () => [{ address: '1.1.1.1', family: 4 }, { address: '10.0.0.1', family: 4 }] }), { code: 800005 });
+  assert.deepEqual(selectPublicAddresses([{ address: '1.1.1.1', family: 4 }, { address: '10.0.0.1', family: 4 }]), [{ address: '1.1.1.1', family: 4 }]);
   await assert.rejects(fetchPublic('https://example.org/feed', { resolve: async () => [] }), { code: 800007 });
 });

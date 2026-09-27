@@ -26,6 +26,11 @@ export function publicUrl(input: string): URL {
 
 type Resolver = (hostname: string) => Promise<{ address: string; family: number }[]>;
 const resolveHost: Resolver = async (hostname) => systemLookup(hostname, { all: true, verbatim: true });
+export function selectPublicAddresses(addresses: { address: string; family: number }[]) {
+  const safe = addresses.filter(({ address, family }) => [4, 6].includes(family) && isIP(address) && !blocked.check(address, family === 4 ? 'ipv4' : 'ipv6'));
+  if (!safe.length) throw new BusinessError(ErrorCodes.UNSAFE_SOURCE_URL);
+  return safe.sort((left, right) => Number(right.family === 4) - Number(left.family === 4));
+}
 
 export async function fetchPublic(input: string, options: { resolve?: Resolver; maxBytes?: number; redirects?: number } = {}): Promise<{ url: string; text: string; contentType: string }> {
   const resolver = options.resolve ?? resolveHost;
@@ -37,25 +42,32 @@ export async function fetchPublic(input: string, options: { resolve?: Resolver; 
     try { addresses = isIP(host) ? [{ address: host, family: isIP(host) }] : await resolver(host); }
     catch { throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE); }
     if (!addresses.length) throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE);
-    if (addresses.some(({ address, family }) => ![4, 6].includes(family) || !isIP(address) || blocked.check(address, family === 4 ? 'ipv4' : 'ipv6'))) throw new BusinessError(ErrorCodes.UNSAFE_SOURCE_URL);
-    const { address, family } = addresses[0];
-    const pinnedLookup: LookupFunction = (_hostname, lookupOptions, callback) => callback(null, lookupOptions.all ? [{ address, family }] : address, family);
-    const response = await new Promise<{ status: number; location?: string; contentType: string; text: string }>((resolve, reject) => {
-      const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, { lookup: pinnedLookup, timeout: 5_000, headers: { 'user-agent': 'AI-Intelligence-Workbench/0.1', accept: 'text/html, application/xml, application/rss+xml, application/json' } }, (stream) => {
-        const status = stream.statusCode ?? 0;
-        if (status >= 300 && status < 400) { stream.resume(); resolve({ status, location: stream.headers.location, contentType: '', text: '' }); return; }
-        if (status < 200 || status >= 300) { stream.resume(); reject(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)); return; }
-        const contentType = String(stream.headers['content-type'] ?? '');
-        if (!/text\/|application\/(xml|rss\+xml|atom\+xml|json|xhtml\+xml)/i.test(contentType)) { stream.resume(); reject(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)); return; }
-        const chunks: Buffer[] = []; let size = 0;
-        stream.on('data', (chunk: Buffer) => { size += chunk.length; if (size > maxBytes) { stream.destroy(); reject(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)); } else chunks.push(chunk); });
-        stream.on('end', () => resolve({ status, contentType, text: Buffer.concat(chunks).toString('utf8') }));
-        stream.on('error', reject);
-      });
-      request.on('timeout', () => request.destroy(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)));
-      request.on('error', reject);
-      request.end();
-    }).catch((error: unknown) => { if (error instanceof BusinessError) throw error; throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE); });
+    const publicAddresses = selectPublicAddresses(addresses);
+    let response: { status: number; location?: string; contentType: string; text: string } | undefined;
+    let lastError: unknown;
+    for (const { address, family } of publicAddresses) {
+      const pinnedLookup: LookupFunction = (_hostname, lookupOptions, callback) => callback(null, lookupOptions.all ? [{ address, family }] : address, family);
+      try {
+        response = await new Promise<{ status: number; location?: string; contentType: string; text: string }>((resolve, reject) => {
+          const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, { lookup: pinnedLookup, timeout: 5_000, headers: { 'user-agent': 'AI-Intelligence-Workbench/0.1', accept: 'text/html, application/xml, application/rss+xml, application/json' } }, (stream) => {
+            const status = stream.statusCode ?? 0;
+            if (status >= 300 && status < 400) { stream.resume(); resolve({ status, location: stream.headers.location, contentType: '', text: '' }); return; }
+            if (status < 200 || status >= 300) { stream.resume(); reject(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)); return; }
+            const contentType = String(stream.headers['content-type'] ?? '');
+            if (!/text\/|application\/(xml|rss\+xml|atom\+xml|json|xhtml\+xml)/i.test(contentType)) { stream.resume(); reject(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)); return; }
+            const chunks: Buffer[] = []; let size = 0;
+            stream.on('data', (chunk: Buffer) => { size += chunk.length; if (size > maxBytes) { stream.destroy(); reject(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)); } else chunks.push(chunk); });
+            stream.on('end', () => resolve({ status, contentType, text: Buffer.concat(chunks).toString('utf8') }));
+            stream.on('error', reject);
+          });
+          request.on('timeout', () => request.destroy(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)));
+          request.on('error', reject);
+          request.end();
+        });
+        break;
+      } catch (error) { lastError = error; }
+    }
+    if (!response) { if (lastError instanceof BusinessError) throw lastError; throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE); }
     if (response.status >= 300 && response.status < 400) {
       if (!response.location) throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE);
       url = publicUrl(new URL(response.location, url).toString());
