@@ -32,7 +32,7 @@ export function openDatabase(path: string): SqliteDatabase {
     for (const [table, name] of [['opportunities', 'last_generated_task_id'], ['content_topics', 'last_generated_task_id']] as const) {
       const columns = new Set((db.pragma(`table_info(${table})`) as { name: string }[]).map(({ name: column }) => column));
       if (!columns.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} INTEGER`);
-      db.prepare(`UPDATE ${table} SET ${name}=COALESCE((SELECT max(t.task_id) FROM scan_tasks t JOIN scan_signals ss ON ss.task_id=t.task_id AND ss.signal_id=${table}.signal_id WHERE t.started_at IS NOT NULL AND t.started_at<=${table}.updated_at AND (t.finished_at IS NULL OR ${table}.updated_at<=t.finished_at)),(SELECT max(t.task_id) FROM scan_tasks t JOIN scan_signals ss ON ss.task_id=t.task_id AND ss.signal_id=${table}.signal_id WHERE t.finished_at IS NOT NULL AND t.finished_at<=${table}.updated_at),0) WHERE ${name} IS NULL`).run();
+      db.prepare(`UPDATE ${table} SET ${name}=COALESCE((SELECT max(t.task_id) FROM scan_tasks t JOIN scan_signals ss ON ss.task_id=t.task_id AND ss.signal_id=${table}.signal_id WHERE t.started_at IS NOT NULL AND t.started_at<=${table}.updated_at AND (t.finished_at IS NULL OR ${table}.updated_at<=t.finished_at)),(SELECT max(t.task_id) FROM scan_tasks t JOIN scan_signals ss ON ss.task_id=t.task_id AND ss.signal_id=${table}.signal_id WHERE t.finished_at IS NOT NULL AND t.finished_at<=${table}.updated_at),0) WHERE ${name} IS NULL OR ${name}=0`).run();
     }
     seedSources(db);
   })(); }

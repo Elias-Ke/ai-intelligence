@@ -77,8 +77,14 @@ test('production migration backfills card generation task markers', () => {
     old.prepare("INSERT INTO opportunities(signal_id,opportunity_type,title,summary,body_json,evidence_score,status,schema_version,created_at,updated_at) VALUES(?,'product','legacy','legacy','{}',60,'candidate','v1',?,?)").run(signalId, time, '2026-09-23T12:00:00.000Z');
     old.exec('ALTER TABLE opportunities DROP COLUMN last_generated_task_id; ALTER TABLE content_topics DROP COLUMN last_generated_task_id'); old.close();
     const db = openDatabase(path);
-    try { assert.equal((db.prepare('SELECT last_generated_task_id value FROM opportunities').get() as { value: number }).value, taskId); }
-    finally { db.close(); }
+    try {
+      assert.equal((db.prepare('SELECT last_generated_task_id value FROM opportunities').get() as { value: number }).value, taskId);
+      db.prepare('UPDATE opportunities SET last_generated_task_id=0').run(); db.close();
+      const reopened = openDatabase(path);
+      try { assert.equal((reopened.prepare('SELECT last_generated_task_id value FROM opportunities').get() as { value: number }).value, taskId); }
+      finally { reopened.close(); }
+    }
+    finally { if (db.open) db.close(); }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 

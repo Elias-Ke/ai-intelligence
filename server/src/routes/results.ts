@@ -61,8 +61,9 @@ export function registerResultRoutes(app: FastifyInstance) {
       if (!term || !/^[\p{L}\p{N}\s-]+$/u.test(term)) throw new BusinessError(ErrorCodes.INVALID_FTS_QUERY);
       const match = term.split(/\s+/).map((part) => `"${part.replaceAll('"', '')}"*`).join(' AND ');
       if (scoped) {
-        clauses.push('(s.title LIKE ? OR COALESCE(ss.summary,s.summary) LIKE ?)');
-        params.push(`%${term}%`, `%${term}%`);
+        const stableMatch = term.split(/\s+/).map((part) => `(title:"${part.replaceAll('"', '')}"* OR tags_text:"${part.replaceAll('"', '')}"* OR search_text:"${part.replaceAll('"', '')}"*)`).join(' AND ');
+        clauses.push(`(s.signal_id IN (SELECT rowid FROM signals_fts WHERE signals_fts MATCH ?) OR s.title LIKE ? OR COALESCE(ss.summary,s.summary) LIKE ? OR s.search_text LIKE ? OR s.tags_text LIKE ?)`);
+        params.push(stableMatch, `%${term}%`, `%${term}%`, `%${term}%`, `%${term}%`);
       } else if (/\p{Script=Han}/u.test(term)) {
         clauses.push('(s.signal_id IN (SELECT rowid FROM signals_fts WHERE signals_fts MATCH ?) OR s.title LIKE ? OR s.summary LIKE ? OR s.search_text LIKE ?)');
         params.push(match, `%${term}%`, `%${term}%`, `%${term}%`);

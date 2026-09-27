@@ -122,6 +122,7 @@ test('a later failed extraction cannot feature or generate cards from an earlier
         db.prepare('UPDATE signals SET novelty_score=99,technology_score=98,adoption_score=97,monetization_score=96,content_value_score=95 WHERE signal_id=?').run(signalId);
         db.prepare("UPDATE signals SET summary='new global summary' WHERE signal_id=?").run(signalId);
         assert.equal((await app.inject(`/api/signals?taskId=${firstTaskId}`)).json().data.items[0].summary, 'Customer workflow pricing');
+        assert.equal((await app.inject(`/api/signals?taskId=${firstTaskId}&q=Customer%20workflow%20pricing`)).json().data.items.length, 1);
         const historical = (await app.inject(`/api/signals/${signalId}?taskId=${firstTaskId}`)).json().data;
         assert.equal(historical.state, 'active');
         assert.equal(historical.evidenceLevel, 'first_party');
