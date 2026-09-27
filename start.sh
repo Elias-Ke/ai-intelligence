@@ -4,6 +4,19 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+if [[ -z "${SQLITE_PATH:-}" ]]; then
+  export SQLITE_PATH="$ROOT_DIR/data/ai-intelligence.db"
+elif [[ "$SQLITE_PATH" != /* ]]; then
+  export SQLITE_PATH="$ROOT_DIR/$SQLITE_PATH"
+fi
+
 if ! command -v pnpm >/dev/null 2>&1; then
   echo "错误：未找到 pnpm，请先安装 pnpm 11。" >&2
   exit 1
