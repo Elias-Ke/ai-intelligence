@@ -119,12 +119,14 @@ test('a later failed extraction cannot feature or generate cards from an earlier
         assert.equal(earlier.evidenceLevel, 'first_party');
         assert.equal(earlier.isHighlighted, 1);
         assert.equal((await app.inject(`/api/signals?taskId=${firstTaskId}&state=active&evidenceLevel=first_party&highlighted=true`)).json().data.items.length, 1);
+        db.prepare('UPDATE signals SET novelty_score=99,technology_score=98,adoption_score=97,monetization_score=96,content_value_score=95 WHERE signal_id=?').run(signalId);
         const historical = (await app.inject(`/api/signals/${signalId}?taskId=${firstTaskId}`)).json().data;
         assert.equal(historical.state, 'active');
         assert.equal(historical.evidenceLevel, 'first_party');
         assert.equal(historical.evidenceCount, 1);
         assert.equal(historical.evidence.length, 1);
         assert.equal(historical.evidence[0].isIndependent, 1);
+        assert.deepEqual([historical.noveltyScore, historical.technologyScore, historical.adoptionScore, historical.monetizationScore, historical.contentValueScore], [65, 70, 70, 70, 65]);
         assert.equal(historical.isHighlighted, 1);
         const current = (await app.inject(`/api/signals/${signalId}?taskId=${taskId}`)).json().data;
         assert.equal(current.evidence[0].isIndependent, 0);
