@@ -84,4 +84,6 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   await generateCards(app, taskId);
   assert.equal((db.prepare('SELECT body_json FROM opportunities WHERE signal_id=?').get(signalId) as { body_json: string }).body_json, currentBody.bodyJson);
   assert.equal((db.prepare('SELECT last_generated_task_id FROM opportunities WHERE signal_id=?').get(signalId) as { last_generated_task_id: number }).last_generated_task_id, currentBody.lastTaskId);
+  const historicalDetail = (await app.inject(`/api/signals/${signalId}?taskId=${taskId}`)).json().data;
+  assert.equal(historicalDetail.opportunities.length, 0);
 });

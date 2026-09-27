@@ -67,6 +67,21 @@ test('production migration adds signal snapshots to an existing database only on
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('production migration backfills card generation task markers', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'intelligence-legacy-cards-')); const path = join(directory, 'main.db');
+  try {
+    const old = openDatabase(path); const time = '2026-09-23T12:00:00.000Z';
+    const taskId = Number(old.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at,finished_at) VALUES('legacy-card','2026-09-22','2026-09-24','completed',?,?)").run(time, time).lastInsertRowid);
+    const signalId = Number(old.prepare("INSERT INTO signals(cluster_key,title,summary,signal_type,relevance_score,novelty_score,truth_score,technology_score,adoption_score,monetization_score,content_value_score,value_score,evidence_level,rules_version,state,created_at,updated_at) VALUES('legacy-card-signal','AI case','summary','use_case',60,60,60,60,60,60,60,60,'single_source','v1','active',?,?)").run(time, time).lastInsertRowid);
+    old.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,created_at) VALUES(?,?,1,?)').run(taskId, signalId, time);
+    old.prepare("INSERT INTO opportunities(signal_id,opportunity_type,title,summary,body_json,evidence_score,status,schema_version,created_at,updated_at) VALUES(?,'product','legacy','legacy','{}',60,'candidate','v1',?,?)").run(signalId, time, time);
+    old.exec('ALTER TABLE opportunities DROP COLUMN last_generated_task_id; ALTER TABLE content_topics DROP COLUMN last_generated_task_id'); old.close();
+    const db = openDatabase(path);
+    try { assert.equal((db.prepare('SELECT last_generated_task_id value FROM opportunities').get() as { value: number }).value, taskId); }
+    finally { db.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('state changes emit safe correlated events only after successful writes', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'intelligence-logs-')); const db = openDatabase(join(directory, 'main.db'));
   const app = createApp({ db, logger: false, autoRunScans: false });
