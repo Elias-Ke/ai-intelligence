@@ -15,6 +15,7 @@ export function openDatabase(path: string): SqliteDatabase {
     if (!columns.has('rejection_reason')) db.exec('ALTER TABLE scan_discoveries ADD COLUMN rejection_reason TEXT');
     const signalColumns = new Set((db.pragma('table_info(scan_signals)') as { name: string }[]).map(({ name }) => name));
     const snapshots = [
+      ['summary', 'TEXT'],
       ['evidence_level', "TEXT CHECK(evidence_level IN ('single_source','multi_source','first_party','conflicting'))"],
       ['state', "TEXT CHECK(state IN ('active','needs_review','archived'))"],
       ['novelty_score', 'INTEGER CHECK(novelty_score BETWEEN 0 AND 100)'],
@@ -28,6 +29,10 @@ export function openDatabase(path: string): SqliteDatabase {
       ['published_at_verified', 'INTEGER CHECK(published_at_verified IN (0,1))']
     ] as const;
     for (const [name, definition] of snapshots) if (!signalColumns.has(name)) db.exec(`ALTER TABLE scan_signals ADD COLUMN ${name} ${definition}`);
+    for (const [table, name] of [['opportunities', 'last_generated_task_id'], ['content_topics', 'last_generated_task_id']] as const) {
+      const columns = new Set((db.pragma(`table_info(${table})`) as { name: string }[]).map(({ name: column }) => column));
+      if (!columns.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} INTEGER`);
+    }
     seedSources(db);
   })(); }
   catch (error) { db.close(); throw error; }

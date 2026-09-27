@@ -50,7 +50,7 @@ test('production migration adds scan status snapshots to an existing database on
 
 test('production migration adds signal snapshots to an existing database only once', () => {
   const directory = mkdtempSync(join(tmpdir(), 'intelligence-legacy-signals-')); const path = join(directory, 'main.db');
-  const names = ['evidence_level', 'state', 'novelty_score', 'truth_score', 'technology_score', 'adoption_score', 'monetization_score', 'content_value_score', 'value_score', 'evidence_count', 'published_at_verified'];
+  const names = ['summary', 'evidence_level', 'state', 'novelty_score', 'truth_score', 'technology_score', 'adoption_score', 'monetization_score', 'content_value_score', 'value_score', 'evidence_count', 'published_at_verified'];
   try {
     const old = openDatabase(path);
     for (const name of names) old.exec(`ALTER TABLE scan_signals DROP COLUMN ${name}`);
@@ -60,6 +60,8 @@ test('production migration adds signal snapshots to an existing database only on
       try {
         const columns = db.pragma('table_info(scan_signals)') as { name: string }[];
         assert.equal(columns.filter(({ name }) => names.includes(name)).length, names.length);
+        assert.ok((db.pragma('table_info(opportunities)') as { name: string }[]).some(({ name }) => name === 'last_generated_task_id'));
+        assert.ok((db.pragma('table_info(content_topics)') as { name: string }[]).some(({ name }) => name === 'last_generated_task_id'));
       } finally { db.close(); }
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }

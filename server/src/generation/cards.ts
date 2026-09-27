@@ -25,7 +25,9 @@ type Evidence = { discoveryId: number; title: string; url: string; snippet: stri
 export async function generateCards(app: FastifyInstance, taskId: number, deadline = Infinity) {
   const counts = { opportunities: 0, topics: 0, failed: 0, errorCode: null as number | null };
   const configured = hasLlmConfig();
-  const signals = app.db.prepare("SELECT s.signal_id signalId,s.title,s.summary,s.signal_type signalType,COALESCE(ss.value_score,s.value_score) valueScore,COALESCE(ss.monetization_score,s.monetization_score) monetizationScore,COALESCE(ss.adoption_score,s.adoption_score) adoptionScore,COALESCE(ss.content_value_score,s.content_value_score) contentValueScore,COALESCE(ss.evidence_level,s.evidence_level) evidenceLevel,CASE WHEN COALESCE(ss.evidence_level,s.evidence_level)='conflicting' THEN 1 ELSE s.has_conflict END hasConflict FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id WHERE ss.task_id=? ORDER BY COALESCE(ss.value_score,s.value_score) DESC,s.signal_id DESC").all(taskId) as Signal[];
+  const latestTaskId = (app.db.prepare("SELECT task_id taskId FROM scan_tasks ORDER BY created_at DESC,task_id DESC LIMIT 1").get() as { taskId: number } | undefined)?.taskId ?? taskId;
+  const isLatestTask = latestTaskId === taskId;
+  const signals = app.db.prepare("SELECT s.signal_id signalId,s.title,COALESCE(ss.summary,s.summary) summary,s.signal_type signalType,COALESCE(ss.value_score,s.value_score) valueScore,COALESCE(ss.monetization_score,s.monetization_score) monetizationScore,COALESCE(ss.adoption_score,s.adoption_score) adoptionScore,COALESCE(ss.content_value_score,s.content_value_score) contentValueScore,COALESCE(ss.evidence_level,s.evidence_level) evidenceLevel,CASE WHEN COALESCE(ss.evidence_level,s.evidence_level)='conflicting' THEN 1 ELSE s.has_conflict END hasConflict FROM signals s JOIN scan_signals ss ON ss.signal_id=s.signal_id WHERE ss.task_id=? ORDER BY COALESCE(ss.value_score,s.value_score) DESC,s.signal_id DESC").all(taskId) as Signal[];
   for (const signal of signals) {
     if (Date.now() >= deadline) { counts.failed++; counts.errorCode ??= ErrorCodes.SCAN_TIMEOUT; break; }
     const acceptedThisScan = app.db.prepare("SELECT 1 FROM signal_sources ss JOIN scan_discoveries sd ON sd.discovery_id=ss.discovery_id JOIN raw_discoveries d ON d.discovery_id=ss.discovery_id WHERE ss.signal_id=? AND sd.task_id=? AND COALESCE(sd.status,d.status)='accepted' LIMIT 1").get(signal.signalId, taskId);
@@ -45,7 +47,7 @@ export async function generateCards(app: FastifyInstance, taskId: number, deadli
         app.log.warn({ event: 'generation.summary.fallback', taskId, signalId: signal.signalId, businessCode: error instanceof BusinessError ? error.code : ErrorCodes.LLM_INVALID_RESPONSE }, 'rule summary preserved');
       }
     }
-    if (signal.summary !== summary) app.db.prepare('UPDATE signals SET summary=?,updated_at=? WHERE signal_id=?').run(summary, new Date().toISOString(), signal.signalId);
+    if (isLatestTask && signal.summary !== summary) app.db.prepare('UPDATE signals SET summary=?,updated_at=? WHERE signal_id=?').run(summary, new Date().toISOString(), signal.signalId);
     const kinds = signal.hasConflict ? [] : [
       ...(signal.valueScore >= 55 && (signal.monetizationScore >= 60 || signal.adoptionScore >= 65) ? ['opportunity' as const] : []),
       ...(signal.valueScore >= 55 && signal.contentValueScore >= 60 ? ['topic' as const] : [])
@@ -70,13 +72,19 @@ export async function generateCards(app: FastifyInstance, taskId: number, deadli
           if (kind === 'opportunity') {
             const entry = card as z.output<typeof opportunitySchema>;
             const opportunityType = signal.signalType === 'use_case' ? 'implementation_service' : signal.signalType === 'paper' ? 'knowledge_service' : signal.signalType === 'market' ? 'content_business' : signal.signalType === 'open_source' ? 'digital_product' : 'product';
-            app.db.prepare("INSERT INTO opportunities(signal_id,opportunity_type,title,summary,body_json,evidence_score,status,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?,'candidate','v1',?,?) ON CONFLICT(signal_id,opportunity_type) DO UPDATE SET title=excluded.title,summary=excluded.summary,body_json=excluded.body_json,evidence_score=excluded.evidence_score,updated_at=excluded.updated_at").run(signal.signalId, opportunityType, entry.title, entry.summary, JSON.stringify({ ...entry, evidence: references }), signal.valueScore, timestamp, timestamp);
-            counts.opportunities++;
+            const existing = app.db.prepare('SELECT last_generated_task_id lastTaskId FROM opportunities WHERE signal_id=? AND opportunity_type=?').get(signal.signalId, opportunityType) as { lastTaskId: number | null } | undefined;
+            if (!existing || existing.lastTaskId === null || existing.lastTaskId <= taskId) {
+              app.db.prepare("INSERT INTO opportunities(signal_id,opportunity_type,title,summary,body_json,evidence_score,status,schema_version,last_generated_task_id,created_at,updated_at) VALUES(?,?,?,?,?,?,'candidate','v1',?,?,?) ON CONFLICT(signal_id,opportunity_type) DO UPDATE SET title=excluded.title,summary=excluded.summary,body_json=excluded.body_json,evidence_score=excluded.evidence_score,last_generated_task_id=excluded.last_generated_task_id,updated_at=excluded.updated_at").run(signal.signalId, opportunityType, entry.title, entry.summary, JSON.stringify({ ...entry, evidence: references }), signal.valueScore, taskId, timestamp, timestamp);
+              counts.opportunities++;
+            }
           } else {
             const entry = card as z.output<typeof topicSchema>;
             const platforms = Object.keys(entry.platformAngles).filter((value) => ['wechat', 'video_account', 'xiaohongshu', 'zhihu', 'bilibili', 'douyin', 'x', 'newsletter'].includes(value));
-            app.db.prepare("INSERT INTO content_topics(signal_id,title,core_viewpoint,body_json,platforms_json,evidence_score,status,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?,'candidate','v1',?,?) ON CONFLICT(signal_id) DO UPDATE SET title=excluded.title,core_viewpoint=excluded.core_viewpoint,body_json=excluded.body_json,platforms_json=excluded.platforms_json,evidence_score=excluded.evidence_score,updated_at=excluded.updated_at").run(signal.signalId, entry.title, entry.coreViewpoint, JSON.stringify({ ...entry, evidence: references }), JSON.stringify(platforms), signal.valueScore, timestamp, timestamp);
-            counts.topics++;
+            const existing = app.db.prepare('SELECT last_generated_task_id lastTaskId FROM content_topics WHERE signal_id=?').get(signal.signalId) as { lastTaskId: number | null } | undefined;
+            if (!existing || existing.lastTaskId === null || existing.lastTaskId <= taskId) {
+              app.db.prepare("INSERT INTO content_topics(signal_id,title,core_viewpoint,body_json,platforms_json,evidence_score,status,schema_version,last_generated_task_id,created_at,updated_at) VALUES(?,?,?,?,?,?,'candidate','v1',?,?,?) ON CONFLICT(signal_id) DO UPDATE SET title=excluded.title,core_viewpoint=excluded.core_viewpoint,body_json=excluded.body_json,platforms_json=excluded.platforms_json,evidence_score=excluded.evidence_score,last_generated_task_id=excluded.last_generated_task_id,updated_at=excluded.updated_at").run(signal.signalId, entry.title, entry.coreViewpoint, JSON.stringify({ ...entry, evidence: references }), JSON.stringify(platforms), signal.valueScore, taskId, timestamp, timestamp);
+              counts.topics++;
+            }
           }
           saved = true;
           app.log.info({ event: 'generation.card.completed', taskId, signalId: signal.signalId, cardType: kind, schemaVersion: 'v1', retryCount: attempt, evidenceCount: references.length }, 'card generated');

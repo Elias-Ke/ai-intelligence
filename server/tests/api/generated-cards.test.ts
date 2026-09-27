@@ -74,4 +74,14 @@ test('cards retry invalid evidence once, persist traceable details, and update w
   forceInvalid = true;
   assert.deepEqual(await generateCards(app, taskId), { opportunities: 0, topics: 0, failed: 1, errorCode: 910003 });
   assert.equal((db.prepare('SELECT count(*) count FROM opportunities').get() as { count: number }).count, 1);
+  const newerTask = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('cards-newer','2026-09-22T00:00:00Z','2026-09-24T00:00:00Z','completed',?)").run('2026-09-24T12:00:00.000Z').lastInsertRowid);
+  db.prepare('INSERT INTO scan_signals(task_id,signal_id,rank_no,summary,value_score,monetization_score,adoption_score,content_value_score,created_at) VALUES(?,?,1,?,64,60,70,65,?)').run(newerTask, signalId, 'newer task summary', time);
+  db.prepare("INSERT INTO scan_discoveries(task_id,discovery_id,discovery_channel,status,discovered_at) VALUES(?,?,'source','accepted',?)").run(newerTask, discoveryId, time);
+  forceInvalid = false;
+  await generateCards(app, newerTask);
+  const currentBody = (db.prepare('SELECT body_json bodyJson,last_generated_task_id lastTaskId FROM opportunities WHERE signal_id=?').get(signalId) as { bodyJson: string; lastTaskId: number });
+  forceInvalid = false;
+  await generateCards(app, taskId);
+  assert.equal((db.prepare('SELECT body_json FROM opportunities WHERE signal_id=?').get(signalId) as { body_json: string }).body_json, currentBody.bodyJson);
+  assert.equal((db.prepare('SELECT last_generated_task_id FROM opportunities WHERE signal_id=?').get(signalId) as { last_generated_task_id: number }).last_generated_task_id, currentBody.lastTaskId);
 });
