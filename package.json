@@ -4,6 +4,7 @@
   "packageManager": "pnpm@11.5.0",
   "scripts": {
     "dev": "pnpm --parallel --recursive dev",
+    "start": "./start.sh",
     "build": "pnpm --recursive build",
     "typecheck": "pnpm --recursive typecheck",
     "test": "pnpm --recursive test",
