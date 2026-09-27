@@ -10,6 +10,8 @@ export function openDatabase(path: string): SqliteDatabase {
   db.pragma('busy_timeout = 5000');
   try { db.transaction(() => {
     db.exec(schemaSql);
+    const sourceColumns = new Set((db.pragma('table_info(sources)') as { name: string }[]).map(({ name }) => name));
+    if (!sourceColumns.has('last_error_reason')) db.exec("ALTER TABLE sources ADD COLUMN last_error_reason TEXT CHECK(last_error_reason IN ('dns_failed','timeout','connection_failed','tls_failed','http_4xx','http_5xx','invalid_content_type','response_too_large','redirect_failed','unknown'))");
     const columns = new Set((db.pragma('table_info(scan_discoveries)') as { name: string }[]).map(({ name }) => name));
     if (!columns.has('status')) db.exec("ALTER TABLE scan_discoveries ADD COLUMN status TEXT CHECK(status IN ('candidate','accepted','rejected','extract_failed'))");
     if (!columns.has('rejection_reason')) db.exec('ALTER TABLE scan_discoveries ADD COLUMN rejection_reason TEXT');

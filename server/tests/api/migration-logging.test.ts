@@ -27,6 +27,7 @@ test('production migration creates the documented indexes and preserves state on
       assert.throws(() => reopened.prepare("INSERT INTO signal_entities(signal_id,entity_id,role) VALUES(999999,999999,'primary')").run());
       assert.equal(reopened.pragma('foreign_keys', { simple: true }), 1);
       assert.equal(reopened.pragma('journal_mode', { simple: true }), 'wal');
+      assert.ok((reopened.pragma('table_info(sources)') as { name: string }[]).some(({ name }) => name === 'last_error_reason'));
     } finally { reopened.close(); }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

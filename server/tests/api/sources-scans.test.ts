@@ -22,6 +22,7 @@ test('API-19/20/23 sources list, create, duplicate and toggle', async () => {
     const list = await app.inject('/api/sources?limit=30');
     assert.equal(list.statusCode, 200);
     assert.equal(list.json().data.items.length, 30);
+    assert.equal(list.json().data.items[0].lastErrorReason, null);
     const created = await app.inject({ method: 'POST', url: '/api/sources', payload: { name: 'Test source', sourceGroup: '新发现候选', kind: 'web', url: 'https://example.org/ai', language: 'mixed', region: 'global', trustLevel: 1 } });
     assert.equal(created.statusCode, 201);
     const sourceId = created.json().data.sourceId;
@@ -32,6 +33,30 @@ test('API-19/20/23 sources list, create, duplicate and toggle', async () => {
     const bad = await app.inject({ method: 'POST', url: '/api/sources', payload: { name: 'Private', sourceGroup: 'x', kind: 'web', url: 'http://127.0.0.1/x', language: 'en', region: 'intl', trustLevel: 1 } });
     assert.equal(bad.json().code, 800005);
   } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('source health exposes a bounded error reason and migration is idempotent', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-source-health-'));
+  const path = join(directory, 'test.db');
+  try {
+    const first = openDatabase(path);
+    first.exec('ALTER TABLE sources DROP COLUMN last_error_reason');
+    first.close();
+    const migrated = openDatabase(path);
+    try {
+      const columns = migrated.pragma('table_info(sources)') as { name: string }[];
+      assert.equal(columns.filter(({ name }) => name === 'last_error_reason').length, 1);
+      migrated.prepare("UPDATE sources SET last_error_code=?,last_error_reason=? WHERE source_id=1").run(800007, 'timeout');
+    } finally { migrated.close(); }
+    const reopened = openDatabase(path);
+    const app = createApp({ db: reopened, logger: false, autoRunScans: false });
+    await app.ready();
+    try {
+      const response = await app.inject('/api/sources?limit=1');
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().data.items[0].lastErrorReason, 'timeout');
+    } finally { await app.close(); reopened.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
 test('API-23 rejects an unreachable source without writing it', async () => {

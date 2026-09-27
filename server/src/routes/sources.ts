@@ -29,7 +29,7 @@ export function registerSourceRoutes(app: FastifyInstance) {
     const cursor = readCursor('sources', query, 1);
     if (cursor) { clauses.push('source_id > ?'); params.push(cursor[0]); }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const rows = app.db.prepare(`SELECT source_id sourceId,name,source_group sourceGroup,kind,url,language,region,trust_level trustLevel,enabled,fetch_interval_minutes fetchIntervalMinutes,last_checked_at lastCheckedAt,last_success_at lastSuccessAt,last_error_code lastErrorCode FROM sources ${where} ORDER BY source_id LIMIT ?`).all(...params, limit + 1) as { sourceId: number }[];
+    const rows = app.db.prepare(`SELECT source_id sourceId,name,source_group sourceGroup,kind,url,language,region,trust_level trustLevel,enabled,fetch_interval_minutes fetchIntervalMinutes,last_checked_at lastCheckedAt,last_success_at lastSuccessAt,last_error_code lastErrorCode,last_error_reason lastErrorReason FROM sources ${where} ORDER BY source_id LIMIT ?`).all(...params, limit + 1) as { sourceId: number }[];
     return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('sources', query, [row.sourceId])), requestId: request.id });
   });
 
@@ -50,7 +50,7 @@ export function registerSourceRoutes(app: FastifyInstance) {
     await app.fetchSource(url, { maxBytes: 16_384 });
     try {
       const result = app.db.prepare('INSERT INTO sources(name,source_group,kind,url,language,region,trust_level,enabled,fetch_interval_minutes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(body.name, body.sourceGroup, body.kind, url, body.language, body.region, body.trustLevel, body.enabled === false ? 0 : 1, interval, createdAt, createdAt);
-      const row = app.db.prepare('SELECT source_id sourceId,name,source_group sourceGroup,kind,url,language,region,trust_level trustLevel,enabled,fetch_interval_minutes fetchIntervalMinutes,last_checked_at lastCheckedAt,last_success_at lastSuccessAt,last_error_code lastErrorCode FROM sources WHERE source_id = ?').get(result.lastInsertRowid);
+      const row = app.db.prepare('SELECT source_id sourceId,name,source_group sourceGroup,kind,url,language,region,trust_level trustLevel,enabled,fetch_interval_minutes fetchIntervalMinutes,last_checked_at lastCheckedAt,last_success_at lastSuccessAt,last_error_code lastErrorCode,last_error_reason lastErrorReason FROM sources WHERE source_id = ?').get(result.lastInsertRowid);
       app.log.info({ event: 'source.created', requestId: request.id, sourceId: result.lastInsertRowid, kind: body.kind, region: body.region, host: new URL(url).host, trustLevel: body.trustLevel, businessCode: 0 }, 'source created');
       return reply.code(201).send({ code: 0, message: 'success', data: row, requestId: request.id });
     } catch (error) {
@@ -70,7 +70,7 @@ export function registerSourceRoutes(app: FastifyInstance) {
       if (remaining.count === 0 && !app.searchClient) throw new BusinessError(ErrorCodes.LAST_SOURCE);
     }
     app.db.prepare('UPDATE sources SET enabled = ?, updated_at = ? WHERE source_id = ?').run(body.enabled ? 1 : 0, now(), id);
-    const row = app.db.prepare('SELECT source_id sourceId,name,source_group sourceGroup,kind,url,language,region,trust_level trustLevel,enabled,fetch_interval_minutes fetchIntervalMinutes,last_checked_at lastCheckedAt,last_success_at lastSuccessAt,last_error_code lastErrorCode FROM sources WHERE source_id = ?').get(id);
+    const row = app.db.prepare('SELECT source_id sourceId,name,source_group sourceGroup,kind,url,language,region,trust_level trustLevel,enabled,fetch_interval_minutes fetchIntervalMinutes,last_checked_at lastCheckedAt,last_success_at lastSuccessAt,last_error_code lastErrorCode,last_error_reason lastErrorReason FROM sources WHERE source_id = ?').get(id);
     app.log.info({ event: 'source.enabled_changed', requestId: request.id, sourceId: id, oldEnabled: Boolean(source.enabled), enabled: body.enabled, businessCode: 0 }, 'source enabled changed');
     return reply.send({ code: 0, message: 'success', data: row, requestId: request.id });
   });
