@@ -62,6 +62,7 @@ test('entity and timeline pages use stable tie-breakers and scoped cursors', asy
     assert.equal((await app.inject('/api/signals?q=%E4%B8%AD%E6%96%87')).json().data.items.length, 3);
     assert.equal((await app.inject('/api/signals?q=%E6%A8%A1%E5%9E%8B%E5%8F%91%E5%B8%83')).json().data.items.length, 3);
     assert.equal((await app.inject('/api/signals?q=broken%28')).json().code, 400002);
+    for (const query of ['taskId=abc', 'taskId=0', 'taskId=1.5', 'entityId=abc', 'entityId=0']) assert.equal((await app.inject(`/api/signals?${query}`)).json().code, 400001, query);
   } finally { await close(); }
 });
 

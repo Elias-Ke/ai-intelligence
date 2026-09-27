@@ -10,6 +10,11 @@ const bool = (value: unknown, code: number, field: string) => {
   return value === 'true' ? 1 : 0;
 };
 const parseJson = (value: unknown, fallback: unknown) => { try { return JSON.parse(String(value ?? '')); } catch { return fallback; } };
+const parseSignalFilterId = (value: unknown, field: string) => {
+  const raw = String(value); const id = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(id) || id < 1) throw new BusinessError(ErrorCodes.INVALID_SIGNAL_FILTER, { field });
+  return id;
+};
 
 function targetExists(app: FastifyInstance, type: string, id: number) {
   const table = type === 'signal' ? 'signals' : type === 'opportunity' ? 'opportunities' : type === 'content_topic' ? 'content_topics' : null;
@@ -44,18 +49,19 @@ export function registerResultRoutes(app: FastifyInstance) {
     const types = ['technology', 'product', 'paper', 'funding', 'company_action', 'use_case', 'open_source', 'market']; const levels = ['single_source', 'multi_source', 'first_party', 'conflicting']; const states = ['active', 'needs_review', 'archived'];
     if ((q.signalType && !types.includes(String(q.signalType))) || (q.evidenceLevel && !levels.includes(String(q.evidenceLevel))) || (q.state && !states.includes(String(q.state))) || (q.sort && !['value', 'newest', 'evidence'].includes(String(q.sort)))) throw new BusinessError(ErrorCodes.INVALID_SIGNAL_FILTER);
     if (q.q && (String(q.q).length > 200 || /["'();]/.test(String(q.q)))) throw new BusinessError(ErrorCodes.INVALID_FTS_QUERY);
-    if (q.taskId && !app.db.prepare('SELECT 1 FROM scan_tasks WHERE task_id=?').get(Number(q.taskId))) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
+    const taskId = q.taskId === undefined ? null : parseSignalFilterId(q.taskId, 'taskId');
+    if (taskId !== null && !app.db.prepare('SELECT 1 FROM scan_tasks WHERE task_id=?').get(taskId)) throw new BusinessError(ErrorCodes.SCAN_NOT_FOUND);
     const clauses: string[] = []; const params: unknown[] = [];
-    const scoped = Boolean(q.taskId);
+    const scoped = taskId !== null;
     const snapshot = (column: string) => scoped ? `COALESCE(ss.${column},s.${column})` : `s.${column}`;
     const state = scoped ? "CASE WHEN s.state='archived' THEN 'archived' ELSE COALESCE(ss.state,s.state) END" : 's.state';
     if (q.signalType) { clauses.push('s.signal_type=?'); params.push(q.signalType); }
     if (q.evidenceLevel) { clauses.push(`${snapshot('evidence_level')}=?`); params.push(q.evidenceLevel); }
     if (q.state) { clauses.push(`${state}=?`); params.push(q.state); }
-    if (q.entityId) { clauses.push('EXISTS(SELECT 1 FROM signal_entities se WHERE se.signal_id=s.signal_id AND se.entity_id=?)'); params.push(Number(q.entityId)); }
+    if (q.entityId !== undefined) { clauses.push('EXISTS(SELECT 1 FROM signal_entities se WHERE se.signal_id=s.signal_id AND se.entity_id=?)'); params.push(parseSignalFilterId(q.entityId, 'entityId')); }
     if (q.saved !== undefined) { clauses.push('COALESCE(i.saved,0)=?'); params.push(bool(q.saved, ErrorCodes.INVALID_SIGNAL_FILTER, 'saved')); }
     if (q.ignored !== undefined) { clauses.push('COALESCE(i.ignored,0)=?'); params.push(bool(q.ignored, ErrorCodes.INVALID_SIGNAL_FILTER, 'ignored')); }
-    if (q.highlighted !== undefined) { if (!q.taskId) throw new BusinessError(ErrorCodes.INVALID_SIGNAL_FILTER); clauses.push('ss.is_highlight=?'); params.push(bool(q.highlighted, ErrorCodes.INVALID_SIGNAL_FILTER, 'highlighted')); }
+    if (q.highlighted !== undefined) { if (taskId === null) throw new BusinessError(ErrorCodes.INVALID_SIGNAL_FILTER); clauses.push('ss.is_highlight=?'); params.push(bool(q.highlighted, ErrorCodes.INVALID_SIGNAL_FILTER, 'highlighted')); }
     if (q.q) {
       const term = String(q.q).trim();
       if (!term || !/^[\p{L}\p{N}\s-]+$/u.test(term)) throw new BusinessError(ErrorCodes.INVALID_FTS_QUERY);
@@ -78,7 +84,7 @@ export function registerResultRoutes(app: FastifyInstance) {
     const keys = sort === 'newest' ? ["COALESCE(s.event_at,'')", 's.signal_id'] : sort === 'evidence' ? [snapshot('truth_score'), snapshot('value_score'), 's.signal_id'] : [priority, "COALESCE(s.event_at,'')", 's.signal_id'];
     const cursor = readCursor('signals', q, keys.length);
     if (cursor) { clauses.push(`(${keys.join(',')}) < (${keys.map(() => '?').join(',')})`); params.push(...cursor); }
-    const rows = (app.db.prepare(`SELECT s.signal_id signalId,s.title,${snapshot('summary')} summary,s.signal_type signalType,s.tags_text tagsText,${primarySource} sourceName,${snapshot('novelty_score')} noveltyScore,${snapshot('truth_score')} truthScore,${snapshot('technology_score')} technologyScore,${snapshot('adoption_score')} adoptionScore,${snapshot('monetization_score')} monetizationScore,${snapshot('content_value_score')} contentValueScore,${snapshot('value_score')} valueScore,${priority} priorityScore,${snapshot('evidence_level')} evidenceLevel,${scoped ? 'COALESCE(ss.evidence_count,(SELECT count(*) FROM signal_sources sx WHERE sx.signal_id=s.signal_id))' : '(SELECT count(*) FROM signal_sources sx WHERE sx.signal_id=s.signal_id)'} evidenceCount,${hasConflict} hasConflict,${scoped ? "COALESCE(ss.published_at_verified,json_extract(s.score_explanation_json,'$.publishedAtVerified'),1)" : "COALESCE(json_extract(s.score_explanation_json,'$.publishedAtVerified'),1)"} publishedAtVerified,${state} state,s.event_at eventAt,${scoped ? 'ss.is_highlight' : 'COALESCE((SELECT sx.is_highlight FROM scan_signals sx WHERE sx.signal_id=s.signal_id ORDER BY sx.task_id DESC LIMIT 1),0)'} isHighlighted,COALESCE(i.saved,0) saved,COALESCE(i.ignored,0) ignored,s.created_at createdAt FROM signals s ${scoped ? 'JOIN scan_signals ss ON ss.signal_id=s.signal_id AND ss.task_id=?' : ''} LEFT JOIN item_states i ON i.target_type='signal' AND i.target_id=s.signal_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${keys.map((key) => `${key} DESC`).join(',')} LIMIT ?`).all(...(scoped ? [Number(q.taskId)] : []), ...params, limit + 1) as Record<string, unknown>[]).map((row) => ({ ...row, sourceName: typeof row.sourceName === 'string' && /^https?:\/\//.test(row.sourceName) ? new URL(row.sourceName).hostname : row.sourceName, tags: String(row.tagsText || '').split(',').filter(Boolean) }));
+    const rows = (app.db.prepare(`SELECT s.signal_id signalId,s.title,${snapshot('summary')} summary,s.signal_type signalType,s.tags_text tagsText,${primarySource} sourceName,${snapshot('novelty_score')} noveltyScore,${snapshot('truth_score')} truthScore,${snapshot('technology_score')} technologyScore,${snapshot('adoption_score')} adoptionScore,${snapshot('monetization_score')} monetizationScore,${snapshot('content_value_score')} contentValueScore,${snapshot('value_score')} valueScore,${priority} priorityScore,${snapshot('evidence_level')} evidenceLevel,${scoped ? 'COALESCE(ss.evidence_count,(SELECT count(*) FROM signal_sources sx WHERE sx.signal_id=s.signal_id))' : '(SELECT count(*) FROM signal_sources sx WHERE sx.signal_id=s.signal_id)'} evidenceCount,${hasConflict} hasConflict,${scoped ? "COALESCE(ss.published_at_verified,json_extract(s.score_explanation_json,'$.publishedAtVerified'),1)" : "COALESCE(json_extract(s.score_explanation_json,'$.publishedAtVerified'),1)"} publishedAtVerified,${state} state,s.event_at eventAt,${scoped ? 'ss.is_highlight' : 'COALESCE((SELECT sx.is_highlight FROM scan_signals sx WHERE sx.signal_id=s.signal_id ORDER BY sx.task_id DESC LIMIT 1),0)'} isHighlighted,COALESCE(i.saved,0) saved,COALESCE(i.ignored,0) ignored,s.created_at createdAt FROM signals s ${scoped ? 'JOIN scan_signals ss ON ss.signal_id=s.signal_id AND ss.task_id=?' : ''} LEFT JOIN item_states i ON i.target_type='signal' AND i.target_id=s.signal_id ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY ${keys.map((key) => `${key} DESC`).join(',')} LIMIT ?`).all(...(scoped ? [taskId] : []), ...params, limit + 1) as Record<string, unknown>[]).map((row) => ({ ...row, sourceName: typeof row.sourceName === 'string' && /^https?:\/\//.test(row.sourceName) ? new URL(row.sourceName).hostname : row.sourceName, tags: String(row.tagsText || '').split(',').filter(Boolean) }));
     const position = (row: Record<string, unknown>) => sort === 'newest' ? [String(row.eventAt ?? ''), Number(row.signalId)] : sort === 'evidence' ? [Number(row.truthScore), Number(row.valueScore), Number(row.signalId)] : [Number(row.priorityScore), String(row.eventAt ?? ''), Number(row.signalId)];
     return reply.send({ code: 0, message: 'success', data: paged(rows, limit, (row) => writeCursor('signals', q, position(row))), requestId: request.id });
   });
