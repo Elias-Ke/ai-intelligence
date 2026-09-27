@@ -33,3 +33,15 @@ test('invalid successful response is treated as unavailable', async () => {
   const client = new AnySearchClient('https://api.anysearch.com', 'test-key', async () => new Response(JSON.stringify({ results: [] }), { status: 200 }));
   await assert.rejects(client.search({ queryText: 'AI', zone: 'intl', language: 'en' }), { code: 300007 });
 });
+
+test('429 is retried once before succeeding', async () => {
+  let attempts = 0;
+  const client = new AnySearchClient('https://api.anysearch.com', 'test-key', async () => {
+    attempts += 1;
+    if (attempts === 1) return new Response('rate limited', { status: 429 });
+    return new Response(JSON.stringify({ code: 0, request_id: 'retry-id', data: { results: [] } }), { status: 200 });
+  });
+  const result = await client.search({ queryText: 'AI', zone: 'intl', language: 'en' });
+  assert.equal(result.requestId, 'retry-id');
+  assert.equal(attempts, 2);
+});

@@ -84,8 +84,9 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   if (fromIndex <= 0) setStep(app, taskId, 'collecting', 'running', discovered);
   const queue = fromIndex <= 0 ? [...sources] : [];
   const articleQueue: { sourceId: number; url: string; title: string; snippet: string; publishedAt: string | null }[] = [];
+  let pendingSearchQueue = 0;
   const timedOut = () => Date.now() >= deadline;
-  const worker = async () => { while (queue.length && discovered + articleQueue.length < 2000 && !timedOut()) {
+  const worker = async () => { while (queue.length && discovered + articleQueue.length + pendingSearchQueue < 2000 && !timedOut()) {
     const source = queue.shift(); if (!source) return;
     let response: Awaited<ReturnType<typeof app.fetchSource>> | undefined;
     let failure: ReturnType<typeof sourceFailure> | undefined;
@@ -102,12 +103,18 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
       }
     }
     if (response) {
-      const items = parseSource(response.text, response.url, source.kind, response.contentType);
-      for (const item of items) { if (discovered + articleQueue.length >= 2000) break; articleQueue.push({ ...item, sourceId: source.sourceId }); }
-      app.db.prepare('UPDATE sources SET last_checked_at=?,last_success_at=?,last_error_code=NULL,last_error_reason=NULL WHERE source_id=?').run(now(), now(), source.sourceId);
-      sourceSucceeded += 1;
-      app.log[items.length ? 'info' : 'warn']({ event: items.length ? 'source.fetch.completed' : 'source.fetch.empty', taskId, sourceId: source.sourceId, resultCount: items.length, retryCount }, 'source fetch completed');
-    } else {
+      try {
+        const items = parseSource(response.text, response.url, source.kind, response.contentType);
+        for (const item of items) { if (discovered + articleQueue.length + pendingSearchQueue >= 2000) break; articleQueue.push({ ...item, sourceId: source.sourceId }); }
+        app.db.prepare('UPDATE sources SET last_checked_at=?,last_success_at=?,last_error_code=NULL,last_error_reason=NULL WHERE source_id=?').run(now(), now(), source.sourceId);
+        sourceSucceeded += 1;
+        app.log[items.length ? 'info' : 'warn']({ event: items.length ? 'source.fetch.completed' : 'source.fetch.empty', taskId, sourceId: source.sourceId, resultCount: items.length, retryCount }, 'source fetch completed');
+      } catch (error) {
+        failure = sourceFailure(error);
+        response = undefined;
+      }
+    }
+    if (!response) {
       const reason = failure?.reason ?? 'unknown';
       const code = failure?.code ?? ErrorCodes.SOURCE_UNREACHABLE;
       app.db.prepare('UPDATE sources SET last_checked_at=?,last_error_code=?,last_error_reason=? WHERE source_id=?').run(now(), code, reason, source.sourceId);
@@ -115,7 +122,8 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
       app.log.warn({ event: 'source.fetch.failed', taskId, sourceId: source.sourceId, businessCode: code, reason, retryCount }, 'source fetch failed');
     }
   } };
-  await Promise.all(Array.from({ length: Math.min(8, sources.length) }, () => worker()));
+  const sourcePromise = (async () => {
+    await Promise.all(Array.from({ length: Math.min(8, sources.length) }, () => worker()));
   const articleWorker = async () => { while (articleQueue.length && discovered < 2000 && !timedOut()) {
     const item = articleQueue.shift(); if (!item) return;
     let content = item.snippet; let publishedAt = item.publishedAt; let extractionFailed = false;
@@ -132,13 +140,14 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     if (saveDiscovery(item.sourceId, item.url, item.title, content, 'source', publishedAt, extractionFailed).isNew) discovered++;
   } };
   await Promise.all(Array.from({ length: 3 }, () => articleWorker()));
+  })();
   let pendingSearch = 0;
   if (app.searchClient && fromIndex <= 0) {
     const searchQueue = buildSearchQueries();
     const knownHosts = new Set((app.db.prepare('SELECT url FROM sources').all() as { url: string }[]).map(({ url }) => new URL(url).hostname));
     const extractionQueue: { url: string; title: string; snippet: string; publishedAt: string | null; searchRunId: number; rank: number }[] = [];
     let quotaExhausted = false;
-    const searchWorker = async () => { while (searchQueue.length && discovered + extractionQueue.length < 2000 && !quotaExhausted && !timedOut()) {
+    const searchWorker = async () => { while (searchQueue.length && discovered + articleQueue.length + pendingSearchQueue < 2000 && !quotaExhausted && !timedOut()) {
       const query = searchQueue.shift(); if (!query) return;
       searchQueries += 1;
       const started = Date.now();
@@ -146,7 +155,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
       try {
         const { requestId, results } = await app.searchClient!.search(query);
         for (const [index, result] of results.entries()) {
-          if (discovered >= 2000) break;
+          if (discovered + articleQueue.length + pendingSearchQueue >= 2000) break;
           try {
             const url = publicUrl(result.url).toString();
             const origin = new URL(url).origin;
@@ -159,7 +168,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
             }
             const date = result.publishedAt ?? result.published_at;
             const publishedAt = date && Number.isFinite(new Date(date).valueOf()) && new Date(date) <= new Date() ? new Date(date).toISOString() : null;
-            if (!result.content?.trim()) extractionQueue.push({ url, title: result.title || url, snippet: result.snippet ?? '', publishedAt, searchRunId: searchRun.searchRunId, rank: index + 1 });
+            if (!result.content?.trim()) { extractionQueue.push({ url, title: result.title || url, snippet: result.snippet ?? '', publishedAt, searchRunId: searchRun.searchRunId, rank: index + 1 }); pendingSearchQueue += 1; }
             else {
               const stored = saveDiscovery(null, url, result.title || url, result.content, 'anysearch', publishedAt);
               if (stored.isNew) discovered += 1;
@@ -168,19 +177,20 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
           } catch (error) { if (!(error instanceof BusinessError)) throw error; }
         }
         app.db.prepare("UPDATE search_runs SET status='completed',anysearch_request_id=?,result_count=?,duration_ms=?,finished_at=? WHERE search_run_id=?").run(requestId, results.length, Date.now() - started, now(), searchRun.searchRunId);
-        app.log.info({ event: 'anysearch.request.completed', taskId, searchRunId: searchRun.searchRunId, queryKey: query.queryKey, zone: query.zone, language: query.language, anysearchRequestId: requestId, resultCount: results.length }, 'AnySearch request completed');
+        app.log.info({ event: 'anysearch.request.completed', taskId, searchRunId: searchRun.searchRunId, queryKey: query.queryKey, zone: query.zone, language: query.language, anysearchRequestId: requestId, resultCount: results.length, durationMs: Date.now() - started }, 'AnySearch request completed');
       } catch (error) {
         const code = error instanceof BusinessError ? error.code : ErrorCodes.SEARCH_UNAVAILABLE;
         app.db.prepare("UPDATE search_runs SET status='failed',error_code=?,duration_ms=?,finished_at=? WHERE search_run_id=?").run(code, Date.now() - started, now(), searchRun.searchRunId);
         if (code === ErrorCodes.SEARCH_QUOTA_EXHAUSTED) quotaExhausted = true;
         failed += 1;
         scanErrorCode ??= code;
-        app.log.warn({ event: 'anysearch.request.failed', taskId, searchRunId: searchRun.searchRunId, queryKey: query.queryKey, businessCode: code }, 'AnySearch request failed');
+        app.log.warn({ event: 'anysearch.request.failed', taskId, searchRunId: searchRun.searchRunId, queryKey: query.queryKey, businessCode: code, durationMs: Date.now() - started }, 'AnySearch request failed');
       }
     } };
     await Promise.all(Array.from({ length: 5 }, () => searchWorker()));
-    const extractionWorker = async () => { while (extractionQueue.length && discovered < 2000 && !timedOut()) {
+    const extractionWorker = async () => { while (extractionQueue.length && discovered + articleQueue.length + pendingSearchQueue <= 2000 && !timedOut()) {
       const item = extractionQueue.shift(); if (!item) return;
+      pendingSearchQueue -= 1;
       let content = item.snippet; let extractionFailed = false;
       try {
         const extracted = await app.searchClient!.extract(item.url);
@@ -198,6 +208,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     await Promise.all(Array.from({ length: 3 }, () => extractionWorker()));
     pendingSearch = searchQueue.length + extractionQueue.length;
   }
+  await sourcePromise;
   if (timedOut() && (queue.length || articleQueue.length || pendingSearch)) { failed++; scanErrorCode ??= ErrorCodes.SCAN_TIMEOUT; }
   if (fromIndex <= 0) {
     app.db.prepare('UPDATE scan_tasks SET discovered_count=?,source_success_count=?,source_failure_count=?,anysearch_query_count=? WHERE task_id=?').run(discovered, sourceSucceeded, sourceFailed, searchQueries, taskId);

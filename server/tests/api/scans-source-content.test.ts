@@ -8,6 +8,7 @@ import { AnySearchClient } from '../../src/ingestion/AnySearchClient.js';
 import { openDatabase } from '../../src/persistence/database.js';
 import { executeScan } from '../../src/routes/scans.js';
 import { SourceFetchError } from '../../src/ingestion/publicHttp.js';
+import { BusinessError, ErrorCodes } from '../../src/domain/errorCodes.js';
 
 test('source articles provide dated body and new search domains remain disabled candidates', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ai-articles-'));
@@ -86,5 +87,36 @@ test('source collection retries transient failures once and isolates permanent f
     assert.deepEqual(db.prepare('SELECT source_success_count sourceSuccessCount,source_failure_count sourceFailureCount,anysearch_query_count anysearchQueryCount FROM scan_tasks WHERE task_id=?').get(taskId), { sourceSuccessCount: 1, sourceFailureCount: 1, anysearchQueryCount: 0 });
     assert.deepEqual(db.prepare('SELECT last_error_code lastError,last_error_reason reason FROM sources WHERE source_id=1').get(), { lastError: null, reason: null });
     assert.deepEqual(db.prepare('SELECT last_error_code lastError,last_error_reason reason FROM sources WHERE source_id=2').get(), { lastError: 800007, reason: 'http_4xx' });
+  } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('source and AnySearch collection run in parallel and quota preserves returned discoveries', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-search-parallel-'));
+  const db = openDatabase(join(directory, 'test.db'));
+  db.prepare('UPDATE sources SET enabled=source_id=1').run();
+  let sourceDone = false;
+  let searchObservedSourcePending = false;
+  let searches = 0;
+  const searchClient = {
+    async search() {
+      if (!sourceDone) searchObservedSourcePending = true;
+      searches += 1;
+      if (searches > 2) throw new BusinessError(ErrorCodes.SEARCH_QUOTA_EXHAUSTED);
+      return { requestId: `search-${searches}`, results: searches === 1 ? [{ title: 'AI case', url: 'https://search.example.org/case', content: 'AI workflow deployed in education', publishedAt: '2026-09-23T12:00:00Z' }] : [] };
+    },
+    async extract() { return { requestId: 'extract-id', content: 'unused' }; }
+  } as unknown as AnySearchClient;
+  const app = createApp({ db, logger: false, searchClient, fetchSource: async (url) => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    sourceDone = true;
+    return { url, contentType: 'text/html', text: '<html><body>empty</body></html>' };
+  }});
+  try {
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('search-parallel','2026-09-23T00:00:00Z','2026-09-24T00:00:00Z','created',?)").run(new Date().toISOString()).lastInsertRowid);
+    await executeScan(app, taskId, new Date('2026-09-23T00:00:00Z'), new Date('2026-09-24T00:00:00Z'));
+    assert.equal(searchObservedSourcePending, true);
+    assert.equal((db.prepare('SELECT count(*) count FROM raw_discoveries').get() as { count: number }).count, 1);
+    assert.equal((db.prepare('SELECT anysearch_query_count count FROM scan_tasks WHERE task_id=?').get(taskId) as { count: number }).count, searches);
+    assert.equal((db.prepare('SELECT status FROM scan_tasks WHERE task_id=?').get(taskId) as { status: string }).status, 'partial_failed');
   } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
 });
