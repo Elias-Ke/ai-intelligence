@@ -1,8 +1,13 @@
-import { lookup as systemLookup } from 'node:dns/promises';
-import { request as httpRequest } from 'node:http';
-import { request as httpsRequest } from 'node:https';
-import { BlockList, isIP, type LookupFunction } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 import { BusinessError, ErrorCodes } from '../domain/errorCodes.js';
+
+export type SourceErrorReason = 'dns_failed' | 'timeout' | 'connection_failed' | 'tls_failed' | 'http_4xx' | 'http_5xx' | 'invalid_content_type' | 'response_too_large' | 'redirect_failed' | 'unknown';
+
+export class SourceFetchError extends BusinessError {
+  constructor(public readonly reason: SourceErrorReason, public readonly httpStatus?: number) {
+    super(ErrorCodes.SOURCE_UNREACHABLE);
+  }
+}
 
 const blocked = new BlockList();
 for (const [range, prefix] of [
@@ -24,56 +29,61 @@ export function publicUrl(input: string): URL {
   return url;
 }
 
-type Resolver = (hostname: string) => Promise<{ address: string; family: number }[]>;
-const resolveHost: Resolver = async (hostname) => systemLookup(hostname, { all: true, verbatim: true });
-export function selectPublicAddresses(addresses: { address: string; family: number }[]) {
-  const safe = addresses.filter(({ address, family }) => [4, 6].includes(family) && isIP(address) && !blocked.check(address, family === 4 ? 'ipv4' : 'ipv6'));
-  if (!safe.length) throw new BusinessError(ErrorCodes.UNSAFE_SOURCE_URL);
-  return safe.sort((left, right) => Number(right.family === 4) - Number(left.family === 4));
+function errorReason(error: unknown): SourceErrorReason {
+  const candidate = error as { name?: string; code?: string; cause?: { code?: string } } | null;
+  const code = candidate?.code ?? candidate?.cause?.code;
+  if (candidate?.name === 'AbortError' || candidate?.name === 'TimeoutError') return 'timeout';
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'dns_failed';
+  if (code === 'CERT_HAS_EXPIRED' || code?.startsWith('ERR_TLS')) return 'tls_failed';
+  if (code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH') return 'connection_failed';
+  return 'unknown';
 }
 
-export async function fetchPublic(input: string, options: { resolve?: Resolver; maxBytes?: number; redirects?: number } = {}): Promise<{ url: string; text: string; contentType: string }> {
-  const resolver = options.resolve ?? resolveHost;
+export async function fetchPublic(input: string, options: { fetchImpl?: typeof fetch; maxBytes?: number; redirects?: number; timeoutMs?: number } = {}): Promise<{ url: string; text: string; contentType: string }> {
+  const fetchImpl = options.fetchImpl ?? fetch;
   const maxBytes = options.maxBytes ?? 512_000;
+  const timeoutMs = options.timeoutMs ?? 8_000;
   let url = publicUrl(input);
   for (let hops = 0; hops <= (options.redirects ?? 3); hops++) {
-    const host = url.hostname.replace(/^\[|\]$/g, '');
-    let addresses: { address: string; family: number }[];
-    try { addresses = isIP(host) ? [{ address: host, family: isIP(host) }] : await resolver(host); }
-    catch { throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE); }
-    if (!addresses.length) throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE);
-    const publicAddresses = selectPublicAddresses(addresses);
-    let response: { status: number; location?: string; contentType: string; text: string } | undefined;
-    let lastError: unknown;
-    for (const { address, family } of publicAddresses) {
-      const pinnedLookup: LookupFunction = (_hostname, lookupOptions, callback) => callback(null, lookupOptions.all ? [{ address, family }] : address, family);
-      try {
-        response = await new Promise<{ status: number; location?: string; contentType: string; text: string }>((resolve, reject) => {
-          const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, { lookup: pinnedLookup, timeout: 5_000, headers: { 'user-agent': 'AI-Intelligence-Workbench/0.1', accept: 'text/html, application/xml, application/rss+xml, application/json' } }, (stream) => {
-            const status = stream.statusCode ?? 0;
-            if (status >= 300 && status < 400) { stream.resume(); resolve({ status, location: stream.headers.location, contentType: '', text: '' }); return; }
-            if (status < 200 || status >= 300) { stream.resume(); reject(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)); return; }
-            const contentType = String(stream.headers['content-type'] ?? '');
-            if (!/text\/|application\/(xml|rss\+xml|atom\+xml|json|xhtml\+xml)/i.test(contentType)) { stream.resume(); reject(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)); return; }
-            const chunks: Buffer[] = []; let size = 0;
-            stream.on('data', (chunk: Buffer) => { size += chunk.length; if (size > maxBytes) { stream.destroy(); reject(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)); } else chunks.push(chunk); });
-            stream.on('end', () => resolve({ status, contentType, text: Buffer.concat(chunks).toString('utf8') }));
-            stream.on('error', reject);
-          });
-          request.on('timeout', () => request.destroy(new BusinessError(ErrorCodes.SOURCE_UNREACHABLE)));
-          request.on('error', reject);
-          request.end();
-        });
-        break;
-      } catch (error) { lastError = error; }
+    let response: Response;
+    try {
+      response = await fetchImpl(url, {
+        redirect: 'manual',
+        signal: AbortSignal.timeout(timeoutMs),
+        headers: {
+          'user-agent': 'AI-Intelligence-Workbench/0.1',
+          accept: 'text/html, application/xml, application/rss+xml, application/json'
+        }
+      });
+    } catch (error) {
+      throw new SourceFetchError(errorReason(error));
     }
-    if (!response) { if (lastError instanceof BusinessError) throw lastError; throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE); }
     if (response.status >= 300 && response.status < 400) {
-      if (!response.location) throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE);
-      url = publicUrl(new URL(response.location, url).toString());
+      const location = response.headers.get('location');
+      if (!location || hops === (options.redirects ?? 3)) throw new SourceFetchError('redirect_failed', response.status);
+      try {
+        url = publicUrl(new URL(location, url).toString());
+      } catch (error) {
+        if (error instanceof BusinessError) throw error;
+        throw new SourceFetchError('redirect_failed', response.status);
+      }
       continue;
     }
-    return { url: url.toString(), text: response.text, contentType: response.contentType };
+    if (!response.ok) throw new SourceFetchError(response.status >= 500 ? 'http_5xx' : 'http_4xx', response.status);
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!/text\/|application\/(xml|rss\+xml|atom\+xml|json|xhtml\+xml)/i.test(contentType)) throw new SourceFetchError('invalid_content_type', response.status);
+    const reader = response.body?.getReader();
+    if (!reader) return { url: url.toString(), text: '', contentType };
+    const chunks: Uint8Array[] = []; let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) { await reader.cancel(); throw new SourceFetchError('response_too_large', response.status); }
+      chunks.push(value);
+    }
+    const text = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8');
+    return { url: url.toString(), text, contentType };
   }
-  throw new BusinessError(ErrorCodes.SOURCE_UNREACHABLE);
+  throw new SourceFetchError('redirect_failed');
 }
