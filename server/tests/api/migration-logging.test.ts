@@ -28,6 +28,7 @@ test('production migration creates the documented indexes and preserves state on
       assert.equal(reopened.pragma('foreign_keys', { simple: true }), 1);
       assert.equal(reopened.pragma('journal_mode', { simple: true }), 'wal');
       assert.ok((reopened.pragma('table_info(sources)') as { name: string }[]).some(({ name }) => name === 'last_error_reason'));
+      for (const name of ['source_success_count', 'source_failure_count', 'anysearch_query_count']) assert.ok((reopened.pragma('table_info(scan_tasks)') as { name: string }[]).some((column) => column.name === name));
     } finally { reopened.close(); }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

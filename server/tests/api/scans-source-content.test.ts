@@ -7,6 +7,7 @@ import { createApp } from '../../src/app.js';
 import { AnySearchClient } from '../../src/ingestion/AnySearchClient.js';
 import { openDatabase } from '../../src/persistence/database.js';
 import { executeScan } from '../../src/routes/scans.js';
+import { SourceFetchError } from '../../src/ingestion/publicHttp.js';
 
 test('source articles provide dated body and new search domains remain disabled candidates', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ai-articles-'));
@@ -62,5 +63,28 @@ test('RSS collection accepts larger official feeds without lifting article respo
     await executeScan(app, taskId, new Date('2026-09-23T00:00:00Z'), new Date('2026-09-24T00:00:00Z'));
     assert.deepEqual(limits, [2_000_000, 0]);
     assert.equal((db.prepare('SELECT count(*) count FROM raw_discoveries').get() as { count: number }).count, 1);
+  } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('source collection retries transient failures once and isolates permanent failures', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-source-retry-'));
+  const db = openDatabase(join(directory, 'test.db'));
+  db.prepare('UPDATE sources SET enabled=source_id IN (1,2)').run();
+  db.prepare("UPDATE sources SET kind='rss' WHERE source_id=1").run();
+  let officialAttempts = 0;
+  const app = createApp({ db, logger: false, searchClient: undefined, fetchSource: async (url) => {
+    if (url === 'https://openai.com/news/' && officialAttempts++ === 0) throw new SourceFetchError('timeout');
+    if (url === 'https://www.anthropic.com/news') throw new SourceFetchError('http_4xx', 404);
+    if (url === 'https://openai.com/news/') return { url, contentType: 'application/rss+xml', text: '<rss><channel><item><title>AI launch</title><link>https://example.org/ai-launch</link><pubDate>2026-09-23T12:00:00Z</pubDate></item></channel></rss>' };
+    return { url, contentType: 'text/html', text: '<article>AI launch details</article>' };
+  }});
+  try {
+    const taskId = Number(db.prepare("INSERT INTO scan_tasks(idempotency_key,range_from,range_to,status,created_at) VALUES('source-retry','2026-09-23T00:00:00Z','2026-09-24T00:00:00Z','created',?)").run(new Date().toISOString()).lastInsertRowid);
+    await executeScan(app, taskId, new Date('2026-09-23T00:00:00Z'), new Date('2026-09-24T00:00:00Z'));
+    assert.equal(officialAttempts, 2);
+    assert.equal((db.prepare('SELECT status FROM scan_tasks WHERE task_id=?').get(taskId) as { status: string }).status, 'partial_failed');
+    assert.deepEqual(db.prepare('SELECT source_success_count sourceSuccessCount,source_failure_count sourceFailureCount,anysearch_query_count anysearchQueryCount FROM scan_tasks WHERE task_id=?').get(taskId), { sourceSuccessCount: 1, sourceFailureCount: 1, anysearchQueryCount: 0 });
+    assert.deepEqual(db.prepare('SELECT last_error_code lastError,last_error_reason reason FROM sources WHERE source_id=1').get(), { lastError: null, reason: null });
+    assert.deepEqual(db.prepare('SELECT last_error_code lastError,last_error_reason reason FROM sources WHERE source_id=2').get(), { lastError: 800007, reason: 'http_4xx' });
   } finally { await app.close(); db.close(); rmSync(directory, { recursive: true, force: true }); }
 });

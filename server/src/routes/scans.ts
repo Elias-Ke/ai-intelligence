@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { BusinessError, ErrorCodes } from '../domain/errorCodes.js';
 import { now, parseLimit, parsePositiveId } from '../http.js';
 import { parseSource } from '../ingestion/parseSource.js';
-import { publicUrl } from '../ingestion/publicHttp.js';
+import { publicUrl, SourceFetchError, type SourceErrorReason } from '../ingestion/publicHttp.js';
 import { buildSearchQueries, QUERY_VERSION } from '../ingestion/searchQueries.js';
 import { analyzeDiscoveries } from '../domain/analyzeDiscoveries.js';
 import { updateTrends } from '../domain/trends.js';
@@ -14,6 +14,14 @@ import { paged, readCursor, writeCursor } from './cursor.js';
 const activeStatuses = ['created', 'collecting', 'normalizing', 'clustering', 'analyzing', 'generating', 'retrying'];
 const steps = ['collecting', 'normalizing', 'clustering', 'analyzing', 'generating'] as const;
 type Step = typeof steps[number];
+
+const retryableSourceReasons = new Set<SourceErrorReason>(['timeout', 'connection_failed', 'tls_failed', 'http_5xx']);
+const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+function sourceFailure(error: unknown) {
+  if (error instanceof SourceFetchError) return { code: error.code, reason: error.reason, retryable: retryableSourceReasons.has(error.reason) || error.httpStatus === 429 };
+  if (error instanceof BusinessError) return { code: error.code, reason: 'unknown' as const, retryable: false };
+  return { code: ErrorCodes.SOURCE_UNREACHABLE, reason: 'unknown' as const, retryable: false };
+}
 
 function setStep(app: FastifyInstance, taskId: number, step: Step, status: 'running' | 'completed' | 'partial_failed', count: number, errorCode: number | null = null) {
   const timestamp = now();
@@ -38,7 +46,7 @@ function rangeWindow(body: Record<string, unknown>) {
   return { from, to };
 }
 
-function taskView(row: Record<string, unknown>) { return { taskId: row.task_id, status: row.status, currentStep: row.current_step, progress: row.progress, discoveredCount: row.discovered_count, signalCount: row.signal_count, opportunityCount: row.opportunity_count, contentTopicCount: row.content_topic_count, rangeFrom: row.range_from, rangeTo: row.range_to, errorCode: row.error_code, errorMessage: row.error_message, createdAt: row.created_at, startedAt: row.started_at, finishedAt: row.finished_at }; }
+function taskView(row: Record<string, unknown>) { return { taskId: row.task_id, status: row.status, currentStep: row.current_step, progress: row.progress, discoveredCount: row.discovered_count, signalCount: row.signal_count, opportunityCount: row.opportunity_count, contentTopicCount: row.content_topic_count, sourceSuccessCount: row.source_success_count ?? 0, sourceFailureCount: row.source_failure_count ?? 0, anysearchQueryCount: row.anysearch_query_count ?? 0, rangeFrom: row.range_from, rangeTo: row.range_to, errorCode: row.error_code, errorMessage: row.error_message, createdAt: row.created_at, startedAt: row.started_at, finishedAt: row.finished_at }; }
 
 export async function executeScan(app: FastifyInstance, taskId: number, rangeFrom: Date, rangeTo: Date, maxDurationMs = 30 * 60_000, resumeFrom: Step = 'collecting') {
   const deadline = Date.now() + maxDurationMs;
@@ -47,6 +55,10 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   const sources = app.db.prepare('SELECT source_id sourceId,url,kind FROM sources WHERE enabled=1 ORDER BY source_id').all() as { sourceId: number; url: string; kind: 'rss' | 'api' | 'web' }[];
   const previous = fromIndex ? app.db.prepare(`SELECT error_code code FROM scan_task_steps WHERE task_id=? AND step_name IN (${steps.slice(0, fromIndex).map(() => '?').join(',')}) AND status IN ('partial_failed','failed')`).all(taskId, ...steps.slice(0, fromIndex)) as { code: number | null }[] : [];
   let failed = previous.length;
+  const priorCounts = app.db.prepare('SELECT source_success_count sourceSuccessCount,source_failure_count sourceFailureCount,anysearch_query_count anysearchQueryCount FROM scan_tasks WHERE task_id=?').get(taskId) as { sourceSuccessCount: number; sourceFailureCount: number; anysearchQueryCount: number };
+  let sourceSucceeded = fromIndex <= 0 ? 0 : priorCounts.sourceSuccessCount;
+  let sourceFailed = fromIndex <= 0 ? 0 : priorCounts.sourceFailureCount;
+  let searchQueries = fromIndex <= 0 ? 0 : priorCounts.anysearchQueryCount;
   let discovered = (app.db.prepare('SELECT count(*) count FROM scan_discoveries WHERE task_id=?').get(taskId) as { count: number }).count;
   let scanErrorCode: number | null = previous.find(({ code }) => code !== null)?.code ?? null;
   const saveDiscovery = app.db.transaction((sourceId: number | null, url: string, title: string, content: string, channel: 'source' | 'anysearch', publishedAt: string | null, extractionFailed = false) => {
@@ -73,7 +85,36 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   const queue = fromIndex <= 0 ? [...sources] : [];
   const articleQueue: { sourceId: number; url: string; title: string; snippet: string; publishedAt: string | null }[] = [];
   const timedOut = () => Date.now() >= deadline;
-  const worker = async () => { while (queue.length && discovered + articleQueue.length < 2000 && !timedOut()) { const source = queue.shift(); if (!source) return; try { const response = await app.fetchSource(source.url, { maxBytes: source.kind === 'rss' ? 2_000_000 : 512_000 }); const items = parseSource(response.text, response.url, source.kind, response.contentType); for (const item of items) { if (discovered + articleQueue.length >= 2000) break; articleQueue.push({ ...item, sourceId: source.sourceId }); } app.db.prepare('UPDATE sources SET last_checked_at=?,last_success_at=?,last_error_code=NULL WHERE source_id=?').run(now(), now(), source.sourceId); app.log[items.length ? 'info' : 'warn']({ event: items.length ? 'source.fetch.completed' : 'source.fetch.empty', taskId, sourceId: source.sourceId, resultCount: items.length }, 'source fetch completed'); } catch (error) { const code = error instanceof BusinessError ? error.code : ErrorCodes.SOURCE_UNREACHABLE; app.db.prepare('UPDATE sources SET last_checked_at=?,last_error_code=? WHERE source_id=?').run(now(), code, source.sourceId); failed += 1; scanErrorCode ??= code; app.log.warn({ event: 'source.fetch.failed', taskId, sourceId: source.sourceId, businessCode: code }, 'source fetch failed'); } } };
+  const worker = async () => { while (queue.length && discovered + articleQueue.length < 2000 && !timedOut()) {
+    const source = queue.shift(); if (!source) return;
+    let response: Awaited<ReturnType<typeof app.fetchSource>> | undefined;
+    let failure: ReturnType<typeof sourceFailure> | undefined;
+    let retryCount = 0;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        response = await app.fetchSource(source.url, { maxBytes: source.kind === 'rss' ? 2_000_000 : 512_000 });
+        break;
+      } catch (error) {
+        failure = sourceFailure(error);
+        if (!failure.retryable || attempt === 1) break;
+        retryCount = 1;
+        await delay(300);
+      }
+    }
+    if (response) {
+      const items = parseSource(response.text, response.url, source.kind, response.contentType);
+      for (const item of items) { if (discovered + articleQueue.length >= 2000) break; articleQueue.push({ ...item, sourceId: source.sourceId }); }
+      app.db.prepare('UPDATE sources SET last_checked_at=?,last_success_at=?,last_error_code=NULL,last_error_reason=NULL WHERE source_id=?').run(now(), now(), source.sourceId);
+      sourceSucceeded += 1;
+      app.log[items.length ? 'info' : 'warn']({ event: items.length ? 'source.fetch.completed' : 'source.fetch.empty', taskId, sourceId: source.sourceId, resultCount: items.length, retryCount }, 'source fetch completed');
+    } else {
+      const reason = failure?.reason ?? 'unknown';
+      const code = failure?.code ?? ErrorCodes.SOURCE_UNREACHABLE;
+      app.db.prepare('UPDATE sources SET last_checked_at=?,last_error_code=?,last_error_reason=? WHERE source_id=?').run(now(), code, reason, source.sourceId);
+      sourceFailed += 1; failed += 1; scanErrorCode ??= code;
+      app.log.warn({ event: 'source.fetch.failed', taskId, sourceId: source.sourceId, businessCode: code, reason, retryCount }, 'source fetch failed');
+    }
+  } };
   await Promise.all(Array.from({ length: Math.min(8, sources.length) }, () => worker()));
   const articleWorker = async () => { while (articleQueue.length && discovered < 2000 && !timedOut()) {
     const item = articleQueue.shift(); if (!item) return;
@@ -99,6 +140,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
     let quotaExhausted = false;
     const searchWorker = async () => { while (searchQueue.length && discovered + extractionQueue.length < 2000 && !quotaExhausted && !timedOut()) {
       const query = searchQueue.shift(); if (!query) return;
+      searchQueries += 1;
       const started = Date.now();
       const searchRun = app.db.prepare("INSERT INTO search_runs(task_id,query_key,query_version,query_text,zone,language,status,started_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(task_id,query_key,zone,language) DO UPDATE SET status='running',error_code=NULL,started_at=excluded.started_at RETURNING search_run_id searchRunId").get(taskId, query.queryKey, QUERY_VERSION, query.queryText, query.zone, query.language, 'running', now()) as { searchRunId: number };
       try {
@@ -158,7 +200,7 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   }
   if (timedOut() && (queue.length || articleQueue.length || pendingSearch)) { failed++; scanErrorCode ??= ErrorCodes.SCAN_TIMEOUT; }
   if (fromIndex <= 0) {
-    app.db.prepare('UPDATE scan_tasks SET discovered_count=? WHERE task_id=?').run(discovered, taskId);
+    app.db.prepare('UPDATE scan_tasks SET discovered_count=?,source_success_count=?,source_failure_count=?,anysearch_query_count=? WHERE task_id=?').run(discovered, sourceSucceeded, sourceFailed, searchQueries, taskId);
     setStep(app, taskId, 'collecting', failed ? 'partial_failed' : 'completed', discovered, scanErrorCode);
   }
   if (fromIndex <= 1) { setStep(app, taskId, 'normalizing', 'running', discovered); setStep(app, taskId, 'normalizing', 'completed', discovered); }
@@ -175,9 +217,9 @@ export async function executeScan(app: FastifyInstance, taskId: number, rangeFro
   failed += generated.failed; scanErrorCode ??= generated.errorCode;
   const persistedCards = app.db.prepare('SELECT (SELECT count(*) FROM opportunities o JOIN scan_signals ss ON ss.signal_id=o.signal_id WHERE ss.task_id=?) opportunities,(SELECT count(*) FROM content_topics c JOIN scan_signals ss ON ss.signal_id=c.signal_id WHERE ss.task_id=?) topics').get(taskId, taskId) as { opportunities: number; topics: number };
   const finalStatus = failed && discovered ? 'partial_failed' : failed ? 'failed' : 'completed';
-  app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,signal_count=?,opportunity_count=?,content_topic_count=?,error_code=?,error_message=?,finished_at=?,heartbeat_at=? WHERE task_id=?').run(finalStatus, 'generating', 100, discovered, signals, persistedCards.opportunities, persistedCards.topics, scanErrorCode, scanErrorCode === null ? null : new BusinessError(scanErrorCode as never).message, now(), now(), taskId);
+  app.db.prepare('UPDATE scan_tasks SET status=?,current_step=?,progress=?,discovered_count=?,signal_count=?,opportunity_count=?,content_topic_count=?,source_success_count=?,source_failure_count=?,anysearch_query_count=?,error_code=?,error_message=?,finished_at=?,heartbeat_at=? WHERE task_id=?').run(finalStatus, 'generating', 100, discovered, signals, persistedCards.opportunities, persistedCards.topics, sourceSucceeded, sourceFailed, searchQueries, scanErrorCode, scanErrorCode === null ? null : new BusinessError(scanErrorCode as never).message, now(), now(), taskId);
   app.taskEvents.emit('changed', taskId);
-  app.log.info({ event: finalStatus === 'completed' ? 'scan.task.completed' : 'scan.task.partial_failed', taskId, discovered, signals, opportunities: generated.opportunities, topics: generated.topics, failed }, 'scan task finished');
+  app.log.info({ event: finalStatus === 'completed' ? 'scan.task.completed' : 'scan.task.partial_failed', taskId, discovered, signals, opportunities: generated.opportunities, topics: generated.topics, failed, sourceSucceeded, sourceFailed, searchQueries }, 'scan task finished');
 }
 
 export async function runScan(app: FastifyInstance, taskId: number) {
