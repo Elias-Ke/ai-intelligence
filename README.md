@@ -1,1 +1,1 @@
-# cppLanguage
+# AI intelligence
